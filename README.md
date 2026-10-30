@@ -75,7 +75,7 @@ Driftwall 是一个 Windows 桌面壁纸工具：它用 LLM 生成风格各异�
 | HTTP | axios |
 | 定时任务 | node-cron |
 | 设置壁纸 | [wallpaper](https://www.npmjs.com/package/wallpaper) |
-| 打包 | electron-builder（NSIS 安装包 + 免安装目录） |
+| 打包 | electron-builder（单文件便携版，免安装） |
 
 ## 🚀 快速开始
 
@@ -96,7 +96,11 @@ npm start
 npm run pack
 ```
 
-产物在 `dist/`：`Driftwall Setup x.y.z.exe`（安装包）与 `dist/win-unpacked/`（免安装目录，数据库与图片会生成在 exe 同级目录）。
+产物在 `dist/`：`Driftwall-x.y.z-portable.exe` —— 单文件便携版，双击即用，无需安装，也不会在桌面创建快捷方式。
+
+首次运行后，`db/`、`images/`、`temp/` 会生成在 **exe 所在目录**（便携版通过 `PORTABLE_EXECUTABLE_DIR` 定位），整个文件夹拷走即可迁移。建议把 exe 放在有写权限的普通文件夹（如 `D:\Tools\Driftwall\`），不要放在 `C:\Program Files\` 下。
+
+> 如需传统安装包，在 `package.json` 的 `build.win.target` 里加回 `"nsis"` 再打包。
 
 ## ⚙️ 配置说明
 

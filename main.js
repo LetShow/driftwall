@@ -8,7 +8,10 @@ const initSqlJs = require("sql.js");
 
 // 运行时数据目录：开发时用项目目录；打包后放在 exe 同级目录（而不是 app.asar 内部），
 // 这样数据库/图片仍可读写，拷走整个文件夹即可迁移（绿色软件）
-const dataRoot = app.isPackaged ? path.dirname(process.execPath) : __dirname;
+// 便携版（portable）运行时 exe 会被解压到临时目录，此时必须用 PORTABLE_EXECUTABLE_DIR
+// 指向用户双击的那个 exe 所在目录，否则数据会写进临时目录、退出即丢失
+const portableDir = process.env.PORTABLE_EXECUTABLE_DIR;
+const dataRoot = portableDir || (app.isPackaged ? path.dirname(process.execPath) : __dirname);
 
 // 数据库文件路径（程序目录下的 db 文件夹，绿色软件可迁移）
 const dbDir = path.join(dataRoot, "db");
