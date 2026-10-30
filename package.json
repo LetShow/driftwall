@@ -34,8 +34,16 @@
     "windows",
     "desktop"
   ],
-  "author": "",
+  "author": "LetShow",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LetShow/driftwall.git"
+  },
+  "homepage": "https://github.com/LetShow/driftwall#readme",
+  "bugs": {
+    "url": "https://github.com/LetShow/driftwall/issues"
+  },
   "dependencies": {
     "axios": "^1.6.0",
     "node-cron": "^3.0.0",

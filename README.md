@@ -2,9 +2,10 @@
 
 > 让桌面自己漂移成一片风景。LLM 写提示词，文生图出图，一键变壁纸，再按你的喜好自我进化。
 
-![platform](https://img.shields.io/badge/platform-Windows-0078D6)
-![electron](https://img.shields.io/badge/Electron-28-47848F?logo=electron&logoColor=white)
-![license](https://img.shields.io/badge/license-MIT-green)
+[![platform](https://img.shields.io/badge/platform-Windows-0078D6)](https://github.com/LetShow/driftwall)
+[![electron](https://img.shields.io/badge/Electron-28-47848F?logo=electron&logoColor=white)](https://github.com/LetShow/driftwall)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-LetShow%2Fdriftwall-181717?logo=github)](https://github.com/LetShow/driftwall)
 
 Driftwall 是一个 Windows 桌面壁纸工具：它用 LLM 生成风格各异的英文提示词，调用文生图 API 生成 4K 壁纸，自动设为系统桌面背景；又通过桌面边缘的悬浮按钮收集"喜欢 / 不喜欢"，把反馈折算成关键字权重，让下一次生成的壁纸越来越对味。
 
@@ -77,7 +78,7 @@ Driftwall 是一个 Windows 桌面壁纸工具：它用 LLM 生成风格各异�
 **环境要求**：Windows 10/11、Node.js ≥ 18
 
 ```bash
-git clone https://github.com/<your-name>/driftwall.git
+git clone https://github.com/LetShow/driftwall.git
 cd driftwall
 npm install
 npm start
@@ -183,6 +184,12 @@ electron-builder 解压 `winCodeSign` 缓存时需要创建 macOS 符号链接�
 **换壁纸报错"请先在设置里填写…"**
 两组接口（LLM / 文生图）的 URL 和 Key 都需要填写，缺一不可。
 
+## 👤 作者
+
+**LetShow** · [github.com/LetShow](https://github.com/LetShow)
+
+项目主页：[github.com/LetShow/driftwall](https://github.com/LetShow/driftwall) · 问题反馈：[Issues](https://github.com/LetShow/driftwall/issues)
+
 ## 📄 License
 
-[MIT](./LICENSE)
+[MIT](./LICENSE) © 2026 LetShow
