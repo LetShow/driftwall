@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>壁纸操作</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg-color: rgba(255, 255, 255, 0.9);
+      --main-color: #007acc;
+      --text-color: #333333;
+      --text-secondary: #666666;
+      --border-color: #dddddd;
+      --btn-like: #4caf50;
+      --btn-dislike: #f44336;
+      --btn-settings: #2196f3;
+      --btn-next: #ff9800;
+      --radius: 10px;
+      --trigger-width: 18px;   /* 默认触发条宽度 */
+      --trigger-handle: 8px;   /* 展开后作为拖把手的宽度 */
+    }
+
+    body {
+      font-family: "Microsoft YaHei", sans-serif;
+      padding: 0;
+      width: 100px;
+      height: 180px;
+      /* 窗口本身完全透明：透明区域不拦截鼠标，不遮挡其他窗口 */
+      background: transparent;
+      overflow: hidden;
+      position: relative;
+      cursor: default;
+    }
+
+    /* 边缘触发条（同时也是拖动把手）：始终可见，极窄
+       方向随窗口实际贴住的屏幕边实时变化：left/right 为竖条，top/bottom 为横条 */
+    .trigger-bar {
+      position: absolute;
+      background: rgba(0, 122, 204, 0.4);
+      cursor: pointer;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      color: #ffffff;
+      user-select: none;
+      opacity: 0.85;
+      transition: opacity 0.15s ease, width 0.15s ease, height 0.15s ease, background 0.15s ease;
+    }
+    /* 左侧贴边：竖条 */
+    body.edge-left .trigger-bar {
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: var(--trigger-width);
+      border-top-right-radius: var(--radius);
+      border-bottom-right-radius: var(--radius);
+    }
+    /* 右侧贴边：竖条 */
+    body.edge-right .trigger-bar {
+      right: 0;
+      top: 0;
+      bottom: 0;
+      width: var(--trigger-width);
+      border-top-left-radius: var(--radius);
+      border-bottom-left-radius: var(--radius);
+    }
+    /* 上侧贴边：横条 */
+    body.edge-top .trigger-bar {
+      left: 0;
+      right: 0;
+      top: 0;
+      height: var(--trigger-width);
+      border-bottom-left-radius: var(--radius);
+      border-bottom-right-radius: var(--radius);
+    }
+    /* 下侧贴边：横条 */
+    body.edge-bottom .trigger-bar {
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: var(--trigger-width);
+      border-top-left-radius: var(--radius);
+      border-top-right-radius: var(--radius);
+    }
+    /* 展开后触发条缩成拖把手 */
+    body.expanded.edge-left .trigger-bar,
+    body.expanded.edge-right .trigger-bar {
+      width: var(--trigger-handle);
+      opacity: 0.5;
+      background: rgba(0, 122, 204, 0.55);
+    }
+    body.expanded.edge-top .trigger-bar,
+    body.expanded.edge-bottom .trigger-bar {
+      height: var(--trigger-handle);
+      opacity: 0.5;
+      background: rgba(0, 122, 204, 0.55);
+    }
+    .trigger-bar:hover {
+      opacity: 1;
+      background: rgba(0, 122, 204, 0.7);
+    }
+    /* 箭头始终指向面板展开的方向 */
+    .arrow {
+      display: inline-block;
+      transition: transform 0.15s ease;
+    }
+    body.edge-right .arrow { transform: rotate(0deg); }
+    body.edge-left .arrow { transform: rotate(180deg); }
+    body.edge-top .arrow { transform: rotate(90deg); }
+    body.edge-bottom .arrow { transform: rotate(-90deg); }
+
+    /* 内容区：默认隐藏透明，不拦截鼠标 */
+    .content {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 8px;
+      background: var(--bg-color);
+      border-radius: var(--radius);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      border: 1px solid var(--border-color);
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.15s ease;
+      z-index: 1;
+    }
+    body.expanded .content {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .btn-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      width: 100%;
+    }
+
+    button {
+      padding: 7px 10px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      width: 100%;
+      color: white;
+    }
+
+    button.like { background: var(--btn-like); }
+    button.like:hover { background: #43a047; }
+    button.like:active { transform: scale(0.96); }
+
+    button.dislike { background: var(--btn-dislike); }
+    button.dislike:hover { background: #d32f2f; }
+    button.dislike:active { transform: scale(0.96); }
+
+    button.next { background: var(--btn-next); }
+    button.next:hover { filter: brightness(1.1); }
+    button.next:active { transform: scale(0.96); }
+
+    button.settings { background: var(--btn-settings); }
+    button.settings:hover { background: #1976d2; }
+    button.settings:active { transform: scale(0.96); }
+
+    .hint {
+      font-size: 10px;
+      color: var(--text-secondary);
+      margin-top: 6px;
+      text-align: center;
+      pointer-events: none;
+      line-height: 1.4;
+      word-break: break-all;
+    }
+    .hint.ok { color: var(--btn-like); font-weight: 600; }
+    .hint.err { color: var(--btn-dislike); font-weight: 600; }
+
+    /* 拖动提示文字（仅在触发条上，跟随触发条方向摆放） */
+    .drag-hint {
+      font-size: 10px;
+      color: rgba(255, 255, 255, 0.7);
+      position: absolute;
+      pointer-events: none;
+      white-space: nowrap;
+      opacity: 0;
+      transition: opacity 0.2s ease;
+      z-index: 3;
+    }
+    body.edge-left .drag-hint { top: 6px; left: calc(var(--trigger-width) + 6px); }
+    body.edge-right .drag-hint { top: 6px; right: calc(var(--trigger-width) + 6px); }
+    body.edge-top .drag-hint {
+      top: calc(var(--trigger-width) + 4px);
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    body.edge-bottom .drag-hint {
+      bottom: calc(var(--trigger-width) + 4px);
+      left: 50%;
+      transform: translateX(-50%);
+    }
+    .trigger-bar:hover ~ .drag-hint,
+    body.dragging .drag-hint {
+      opacity: 1;
+    }
+  </style>
+</head>
+<body class="edge-right collapsed" id="floatBody">
+  <!-- 边缘触发条：始终可见，拖动把手（方向随贴边位置自动变化） -->
+  <div class="trigger-bar" id="triggerBar" title="随机壁纸（拖动可移动窗口）"><span class="arrow">»</span></div>
+  <div class="drag-hint" id="dragHint">拖动移动</div>
+
+  <div class="content">
+    <div class="btn-group">
+      <button class="like" onclick="likeImage()">❤️ 喜欢</button>
+      <button class="dislike" onclick="dislikeImage()">👎 不喜欢</button>
+      <button class="next" onclick="nextWallpaper()">⏭️ 下一个</button>
+      <button class="settings" onclick="openSettings()">⚙️ 设置</button>
+    </div>
+    <div class="hint" id="floatHint">移开自动隐藏</div>
+  </div>
+
+  <script>
+    const floatBody = document.getElementById('floatBody');
+    const triggerBar = document.getElementById('triggerBar');
+    let currentImageId = null;
+    let hideTimer = null;
+    let expanded = false;
+    let hideDelay = 1500;
+
+    // 当前窗口位置（用于拖动）
+    let curX = 0, curY = 0;
+    let isDragging = false;
+    let dragStartX = 0, dragStartY = 0;
+    let dragDistance = 0;
+    let capturePointerId = null;
+
+    // 窗口尺寸与显示器信息（用于判断贴住哪条屏幕边）
+    let winW = 100, winH = 180;
+    let displays = [];
+    let posReady = false;
+    let themeReady = false;
+    // 当前贴边方向：left / right / top / bottom
+    let currentEdge = 'right';
+    // 拖动过程中方向变过但还没落库
+    let edgeDirty = false;
+
+    // 距离屏幕边缘多少像素以内算“贴边”（超出则保持原方向）
+    const EDGE_MAX_DIST = 100;
+    // 拖动结束时的吸附距离（小于该值直接吸到边缘）
+    const SNAP_DIST = 24;
+
+    function renderClass() {
+      const parts = ['edge-' + currentEdge, expanded ? 'expanded' : 'collapsed'];
+      if (isDragging) parts.push('dragging');
+      floatBody.className = parts.join(' ');
+    }
+
+    // 把设置里的位置（如 left-top / right-bottom）归一成贴边方向
+    function normalizeSide(pos) {
+      if (!pos) return null;
+      if (pos === 'left' || pos === 'right' || pos === 'top' || pos === 'bottom') return pos;
+      if (pos.indexOf('left') === 0) return 'left';
+      if (pos.indexOf('right') === 0) return 'right';
+      if (pos.indexOf('top') === 0) return 'top';
+      if (pos.indexOf('bottom') === 0) return 'bottom';
+      return null;
+    }
+
+    function persistEdge() {
+      edgeDirty = false;
+      window.wallpaperApi.setSetting('float_position', currentEdge);
+    }
+
+    // 切换触发条方向；persist=true 时写入设置，重启后保持
+    function applyEdge(edge, persist) {
+      if (!edge || edge === currentEdge) return;
+      currentEdge = edge;
+      renderClass();
+      if (persist) persistEdge();
+      else edgeDirty = true;
+    }
+
+    // 取窗口中心所在的显示器工作区；找不到则取最近的
+    function workAreaAt(x, y) {
+      if (!displays.length) return null;
+      const cx = x + winW / 2;
+      const cy = y + winH / 2;
+      let best = null;
+      let bestDist = Infinity;
+      for (const d of displays) {
+        const b = d.bounds;
+        if (cx >= b.x && cx <= b.x + b.width && cy >= b.y && cy <= b.y + b.height) {
+          return d.workArea;
+        }
+        const dx = Math.max(b.x - cx, cx - (b.x + b.width), 0);
+        const dy = Math.max(b.y - cy, cy - (b.y + b.height), 0);
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestDist) { bestDist = dist; best = d; }
+      }
+      return best ? best.workArea : null;
+    }
+
+    // 计算窗口最靠近哪条屏幕边
+    function nearestEdge(x, y) {
+      const a = workAreaAt(x, y);
+      if (!a) return null;
+      const dists = {
+        left: x - a.x,
+        right: (a.x + a.width) - (x + winW),
+        top: y - a.y,
+        bottom: (a.y + a.height) - (y + winH),
+      };
+      let edge = 'right';
+      let min = Infinity;
+      for (const k of Object.keys(dists)) {
+        if (dists[k] < min) { min = dists[k]; edge = k; }
+      }
+      return { edge, dist: min, area: a };
+    }
+
+    function clampTo(v, min, max) {
+      if (max < min) max = min;
+      return Math.min(Math.max(v, min), max);
+    }
+
+    // 用真实坐标校正贴边方向（初始化、主题变更、显示器变化后调用）
+    function maybeCorrectEdge() {
+      if (!posReady || !themeReady || !displays.length) return;
+      const r = nearestEdge(curX, curY);
+      if (r && r.dist <= EDGE_MAX_DIST) applyEdge(r.edge, true);
+    }
+
+    async function refreshDisplays() {
+      try {
+        displays = (await window.wallpaperApi.getDisplays()) || [];
+      } catch (e) {
+        displays = [];
+      }
+    }
+
+    function applyTheme(theme) {
+      if (!theme) return;
+      document.documentElement.style.setProperty('--bg-color', theme.bgColor || 'rgba(255, 255, 255, 0.9)');
+      document.documentElement.style.setProperty('--main-color', theme.mainColor || '#007acc');
+      document.documentElement.style.setProperty('--text-color', theme.textColor || '#333333');
+      document.documentElement.style.setProperty('--text-secondary', theme.textSecondary || '#666666');
+      document.documentElement.style.setProperty('--border-color', theme.borderColor || '#dddddd');
+      document.documentElement.style.setProperty('--btn-like', theme.btnLike || '#4caf50');
+      document.documentElement.style.setProperty('--btn-dislike', theme.btnDislike || '#f44336');
+      document.documentElement.style.setProperty('--btn-settings', theme.btnSettings || '#2196f3');
+      document.documentElement.style.setProperty('--btn-next', theme.btnNext || '#ff9800');
+      document.documentElement.style.setProperty('--radius', theme.borderRadius || '10px');
+      hideDelay = parseInt(theme.hideDelay) || 1500;
+
+      // 贴边方向：优先用已保存的方向，随后 maybeCorrectEdge() 会按真实坐标校正
+      currentEdge = normalizeSide(theme.position) || currentEdge;
+      expanded = false;
+      if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      renderClass();
+      themeReady = true;
+    }
+
+    window.wallpaperApi.onThemeChanged((theme) => {
+      applyTheme(theme);
+      maybeCorrectEdge();
+    });
+
+    // 接收初始位置
+    window.wallpaperApi.onFloatPos((pos) => {
+      curX = pos.x;
+      curY = pos.y;
+      if (pos.w) winW = pos.w;
+      if (pos.h) winH = pos.h;
+      posReady = true;
+      refreshDisplays().then(maybeCorrectEdge);
+    });
+
+    function setExpanded(yes) {
+      if (yes === expanded) return;
+      expanded = yes;
+      if (yes) {
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+      }
+      renderClass();
+    }
+
+    // 鼠标移入整个悬浮窗 -> 展开
+    floatBody.addEventListener('mouseenter', () => setExpanded(true));
+    // 鼠标移出整个悬浮窗 -> 延时收回
+    floatBody.addEventListener('mouseleave', () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(() => setExpanded(false), hideDelay);
+    });
+    // 点击触发条 -> 立即展开（拖动过则忽略，避免拖完误展开）
+    triggerBar.addEventListener('click', () => {
+      if (dragDistance > 5) { dragDistance = 0; return; }
+      setExpanded(true);
+    });
+
+    // ---------- 拖动逻辑（仅从触发条发起） ----------
+    function startDrag(e) {
+      if (e.button !== undefined && e.button !== 0) return; // 只响应左键
+      isDragging = true;
+      dragStartX = e.screenX;
+      dragStartY = e.screenY;
+      dragDistance = 0;
+      if (e.pointerId !== undefined) {
+        capturePointerId = e.pointerId;
+        try { triggerBar.setPointerCapture(e.pointerId); } catch (err) {}
+      }
+      renderClass();
+      triggerBar.style.cursor = 'move';
+      document.body.style.cursor = 'move';
+      e.preventDefault();
+    }
+
+    function onDragMove(e) {
+      if (!isDragging) return;
+      const dx = e.screenX - dragStartX;
+      const dy = e.screenY - dragStartY;
+      dragDistance += Math.abs(dx) + Math.abs(dy);
+      let nx = curX + dx;
+      let ny = curY + dy;
+
+      // 不允许拖出当前显示器的工作区
+      const area = workAreaAt(nx, ny);
+      if (area) {
+        nx = clampTo(nx, area.x, area.x + area.width - winW);
+        ny = clampTo(ny, area.y, area.y + area.height - winH);
+      }
+      // 拖动过程中实时把触发条切换到正在靠近的那条边
+      const r = nearestEdge(nx, ny);
+      if (r && r.dist <= EDGE_MAX_DIST) applyEdge(r.edge, false);
+
+      window.wallpaperApi.moveFloat(nx, ny);
+      curX = nx;
+      curY = ny;
+      dragStartX = e.screenX;
+      dragStartY = e.screenY;
+    }
+
+    function endDrag() {
+      if (!isDragging) return;
+      isDragging = false;
+      if (capturePointerId !== null) {
+        try { triggerBar.releasePointerCapture(capturePointerId); } catch (err) {}
+        capturePointerId = null;
+      }
+      renderClass();
+      triggerBar.style.cursor = 'pointer';
+      document.body.style.cursor = '';
+
+      // 结束时：贴近边缘则吸附过去，并确定最终的触发条方向
+      const r = nearestEdge(curX, curY);
+      if (r) {
+        if (r.dist <= SNAP_DIST) {
+          if (r.edge === 'left') curX = r.area.x;
+          else if (r.edge === 'right') curX = r.area.x + r.area.width - winW;
+          else if (r.edge === 'top') curY = r.area.y;
+          else curY = r.area.y + r.area.height - winH;
+        }
+        if (r.dist <= EDGE_MAX_DIST) applyEdge(r.edge, true);
+      }
+      // 落库：最终方向 + 最终坐标
+      if (edgeDirty) persistEdge();
+      window.wallpaperApi.moveFloat(curX, curY, true);
+    }
+
+    // pointer 事件为主，鼠标事件兜底（拖动期间窗口跟随光标移动）
+    triggerBar.addEventListener('pointerdown', startDrag);
+    triggerBar.addEventListener('mousedown', startDrag);
+    window.addEventListener('pointermove', onDragMove);
+    window.addEventListener('mousemove', onDragMove);
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('mouseup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+    window.addEventListener('blur', endDrag);
+
+    // ---------- 喜欢 / 不喜欢 ----------
+    const DEFAULT_HINT = '移开自动隐藏';
+    const hintEl = document.getElementById('floatHint');
+    let ratingBusy = false;
+    let hintTimer = null;
+
+    function showHint(text, kind) {
+      if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+      hintEl.textContent = text;
+      hintEl.className = 'hint' + (kind ? ' ' + kind : '');
+      if (kind) {
+        hintTimer = setTimeout(() => {
+          hintEl.textContent = DEFAULT_HINT;
+          hintEl.className = 'hint';
+          hintTimer = null;
+        }, 4000);
+      }
+    }
+
+    function setRatingDisabled(yes) {
+      document.querySelectorAll('.content button').forEach((b) => { b.disabled = yes; });
+    }
+
+    async function rateImage(type) {
+      if (ratingBusy || switchBusy) return { success: false, message: "正在处理，请稍候" };
+      ratingBusy = true;
+      setRatingDisabled(true);
+      try {
+        // id 为空时主进程会自动使用它记录的“当前壁纸”
+        const res = type === 'liked'
+          ? await window.wallpaperApi.likeImage(currentImageId)
+          : await window.wallpaperApi.dislikeImage(currentImageId);
+        showHint((res && res.message) || '操作失败，请重试', res && res.success ? 'ok' : 'err');
+        return res;
+      } catch (e) {
+        showHint('操作失败：' + (e && e.message ? e.message : e), 'err');
+        return { success: false, message: String(e && e.message ? e.message : e) };
+      } finally {
+        ratingBusy = false;
+        setRatingDisabled(false);
+      }
+    }
+
+    function likeImage() { return rateImage('liked'); }
+    function dislikeImage() { return rateImage('disliked'); }
+
+    // 下一个：按设置里的“换壁纸方式”（随机 / 顺序）切到下一张
+    let switchBusy = false;
+    async function nextWallpaper() {
+      if (switchBusy || ratingBusy) return;
+      switchBusy = true;
+      setRatingDisabled(true);
+      showHint('正在切换壁纸…');
+      try {
+        const res = await window.wallpaperApi.changeWallpaper();
+        if (res && res.success) {
+          showHint('已换上新壁纸 ✓', 'ok');
+        } else {
+          showHint((res && res.error) || '切换失败，请重试', 'err');
+        }
+      } catch (e) {
+        showHint('切换失败：' + (e && e.message ? e.message : e), 'err');
+      } finally {
+        switchBusy = false;
+        setRatingDisabled(false);
+      }
+    }
+
+    function openSettings() {
+      window.wallpaperApi.openMainWindow();
+    }
+
+    // 主进程推送“当前壁纸”：换壁纸后悬浮窗自动指向新图
+    window.wallpaperApi.onCurrentImage((img) => {
+      const prevId = currentImageId;
+      currentImageId = img ? img.id : null;
+      if (!img) {
+        showHint('当前没有壁纸', 'err');
+      } else if (prevId && prevId !== img.id) {
+        showHint('已换上新壁纸 ✓', 'ok');
+      } else if (!prevId) {
+        showHint(DEFAULT_HINT);
+      }
+    });
+
+    async function init() {
+      try {
+        const theme = await window.wallpaperApi.getTheme();
+        applyTheme(theme);
+      } catch (e) {
+        console.log('加载主题色失败，使用默认值');
+        themeReady = true;
+      }
+      await refreshDisplays();
+      maybeCorrectEdge();
+      // 当前显示中的壁纸（喜欢/不喜欢的操作对象）
+      try {
+        const img = await window.wallpaperApi.getCurrentImage();
+        currentImageId = img ? img.id : null;
+        if (!img) showHint('还没有壁纸，打开设置换一张', 'err');
+      } catch (e) {
+        console.log('获取当前壁纸失败:', e);
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Driftwall · 随机壁纸</title>
+  <style>
+    :root {
+      --main-color: #007acc;
+      --main-color-hover: #005a9e;
+      --bg-color: #f5f5f5;
+      --card-bg: #ffffff;
+      --text-color: #333333;
+      --text-secondary: #666666;
+      --border-color: #dddddd;
+    }
+
+    * { box-sizing: border-box; }
+    body { font-family: "Microsoft YaHei", sans-serif; padding: 20px; background: var(--bg-color); margin: 0; color: var(--text-color); }
+    .container { max-width: 800px; margin: 0 auto; }
+    .card { background: var(--card-bg); padding: 24px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; border: 1px solid var(--border-color); }
+    h2 { margin-top: 0; color: var(--text-color); font-size: 20px; border-bottom: 2px solid var(--main-color); padding-bottom: 8px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; margin-bottom: 6px; color: var(--text-secondary); font-size: 14px; font-weight: 500; }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      width: 100%; padding: 8px 12px; border: 1px solid var(--border-color); border-radius: 4px; font-size: 14px; background: var(--card-bg); color: var(--text-color);
+    }
+    input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus, select:focus { outline: none; border-color: var(--main-color); }
+    .btn-group { display: flex; gap: 10px; margin-top: 8px; }
+    button { padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    button.primary { background: var(--main-color); color: white; }
+    button.primary:hover { background: var(--main-color-hover); }
+    button.secondary { background: var(--border-color); color: var(--text-color); }
+    button.secondary:hover { background: #e0e0e0; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .msg { margin-top: 10px; padding: 8px; border-radius: 4px; font-size: 13px; display: none; }
+    .msg.success { background: #e7f3e8; color: #2e7d32; border: 1px solid #c3e6c5; display: block; }
+    .msg.error { background: #fdecea; color: #c62828; border: 1px solid #f5c6c6; display: block; }
+    .preview { margin-top: 20px; border: 1px solid var(--border-color); border-radius: 4px; overflow: hidden; }
+    .preview img { width: 100%; height: auto; display: block; }
+    .keywords { margin-top: 12px; font-size: 12px; color: var(--text-secondary); }
+    .keywords span { display: inline-block; background: #f0f0f0; padding: 4px 8px; border-radius: 4px; margin-right: 6px; margin-bottom: 6px; }
+
+    /* 颜色选择器行 */
+    .color-row { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+    .color-item { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+    .color-item label { font-size: 12px; margin: 0; white-space: nowrap; }
+    input[type="color"] { width: 40px; height: 40px; border: none; border-radius: 8px; cursor: pointer; background: none; }
+    input[type="color"]::-webkit-color-swatch-wrapper { padding: 0; }
+    input[type="color"]::-webkit-color-swatch { border: none; border-radius: 8px; }
+
+    .preset-row { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .preset-row select { width: 200px; }
+
+    .theme-hint { font-size: 12px; color: var(--text-secondary); margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h2>随机壁纸设置</h2>
+
+      <div class="form-group">
+        <label>LLM 模型网址</label>
+        <input id="model_url" type="text" placeholder="https://apihub.agnes-ai.com/v1/chat/completions">
+      </div>
+
+      <div class="form-group">
+        <label>LLM API Key</label>
+        <input id="api_key" type="password" placeholder="sk-...">
+      </div>
+
+      <div class="form-group">
+        <label>文生图模型网址</label>
+        <input id="image_url" type="text" placeholder="https://apihub.agnes-ai.com/v1/images/generations">
+      </div>
+
+      <div class="form-group">
+        <label>文生图 API Key</label>
+        <input id="image_key" type="password" placeholder="sk-...">
+      </div>
+
+      <div class="form-group">
+        <label>启用自动换壁纸</label>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <input id="auto_change_enabled" type="checkbox" checked>
+          <label style="margin:0;">启用定时自动更换壁纸</label>
+        </div>
+        <div class="theme-hint">开启后，程序会按照设定的间隔自动更换壁纸</div>
+      </div>
+
+      <div class="form-group">
+        <label>换壁频率（分钟）</label>
+        <input id="interval" type="number" value="60" min="5">
+        <div class="theme-hint">设置自动更换壁纸的时间间隔，最小5分钟</div>
+      </div>
+
+      <div class="form-group">
+        <label>换壁纸方式</label>
+        <select id="change_mode" data-default="random">
+          <option value="random">随机更换（按权重抽取下一张）</option>
+          <option value="sequential">按顺序更换（按生成先后依次切换）</option>
+        </select>
+        <div class="theme-hint">定时换壁、悬浮按钮“下一个”都按这里的方式挑选壁纸；顺序模式切到最后一张后回到第一张</div>
+      </div>
+
+      <div class="form-group">
+        <label>风格随机程度</label>
+        <select id="style_explore_rate" data-default="0.5">
+          <option value="0.2">保守（20% 完全随机，偏向历史喜好）</option>
+          <option value="0.5">均衡（50% 完全随机，推荐）</option>
+          <option value="0.8">活跃（80% 完全随机，快速收集喜好数据）</option>
+          <option value="1">全随机（忽略历史关键字，风格最多样）</option>
+        </select>
+        <div class="theme-hint">每次生成时“主题”完全随机探索的概率（风格/色调/光照/构图/氛围每次都随机）。越高越容易出新风格，收集到的关键字喜好数据也越多</div>
+      </div>
+
+      <div class="form-group">
+        <label>LLM 超时时间（秒，默认 120）</label>
+        <input id="llm_timeout" type="number" value="120" min="30">
+      </div>
+
+      <div class="form-group">
+        <label>文生图超时时间（秒，默认 180）</label>
+        <input id="image_timeout" type="number" value="180" min="60">
+      </div>
+
+      <div class="form-group">
+        <label>图片保存文件夹</label>
+        <input id="image_dir" type="text" placeholder="留空则使用程序目录/images">
+      </div>
+
+      <div class="form-group">
+        <label>临时文件清理间隔（天）</label>
+        <select id="temp_clean_interval" data-default="7">
+          <option value="0">从不清理</option>
+          <option value="1">1 天</option>
+          <option value="7">7 天（每周）</option>
+          <option value="30">30 天（每月）</option>
+        </select>
+        <div class="theme-hint">标记「不喜欢」的图片会移入程序目录 temp 文件夹，超过该天数自动删除；0 = 从不清理</div>
+      </div>
+
+      <!-- 壁纸生成显示器选择（多显示器） -->
+      <div class="form-group">
+        <label>壁纸生成显示器</label>
+        <select id="wallpaper_display">
+          <option value="primary">主显示器</option>
+          <option value="current">当前壁纸所在显示器</option>
+        </select>
+        <div class="theme-hint">选择为哪个显示器生成壁纸，不同比例的显示器会生成对应比例的图片</div>
+      </div>
+
+      <!-- 悬浮按钮显示器选择（多显示器） -->
+      <div class="form-group">
+        <label>悬浮按钮显示器</label>
+        <select id="float_display"></select>
+        <div class="theme-hint">选择"喜欢/不喜欢"悬浮按钮显示在哪个显示器的边缘</div>
+      </div>
+
+      <div class="form-group" id="progressGroup" style="display:none;">
+        <label style="color:#007acc;font-weight:600;">🔄 正在处理...</label>
+        <div id="progressLog" style="background:#f8f9fa;padding:12px;border-radius:4px;font-size:12px;font-family:Consolas,monospace;color:#333;max-height:120px;overflow-y:auto;white-space:pre-wrap;"></div>
+      </div>
+
+      <div class="form-group">
+        <label>预生成图片库</label>
+        <div style="display:flex;align-items:center;gap:10px;">
+          <input id="preload_enabled" type="checkbox" checked>
+          <label style="margin:0;">启用后台预生成（空闲时自动生成壁纸，加快切换速度）</label>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>空闲多少分钟后开始预生成（分钟）</label>
+        <input id="preload_idle" type="number" value="5" min="1">
+      </div>
+
+      <div class="form-group">
+        <label>预生成库最大图片数量</label>
+        <input id="preload_max" type="number" value="10" min="1">
+      </div>
+
+      <div class="btn-group">
+        <button class="primary" onclick="saveSettings()">保存设置</button>
+        <button class="secondary" onclick="changeNow()">立即换壁纸</button>
+      </div>
+      <div id="msg" class="msg"></div>
+    </div>
+
+    <!-- 主题色设置卡片 -->
+    <div class="card">
+      <h2>🎨 主题色设置</h2>
+
+      <div class="preset-row">
+        <label>预设主题</label>
+        <select id="theme_preset">
+          <option value="default">默认（蓝色）</option>
+          <option value="dark">深色（夜间）</option>
+          <option value="green">绿色（自然）</option>
+          <option value="pink">粉色（温暖）</option>
+          <option value="custom">自定义</option>
+        </select>
+        <div class="theme-hint">选择预设主题可一键切换，也可手动调整下方各项颜色</div>
+      </div>
+
+      <div class="color-row">
+        <div class="color-item">
+          <label>主色调</label>
+          <input id="theme_main_color" type="color" value="#007acc">
+        </div>
+        <div class="color-item">
+          <label>页面背景</label>
+          <input id="theme_bg_color" type="color" value="#f5f5f5">
+        </div>
+        <div class="color-item">
+          <label>卡片背景</label>
+          <input id="theme_card_bg" type="color" value="#ffffff">
+        </div>
+        <div class="color-item">
+          <label>主文字</label>
+          <input id="theme_text_color" type="color" value="#333333">
+        </div>
+        <div class="color-item">
+          <label>次要文字</label>
+          <input id="theme_text_secondary" type="color" value="#666666">
+        </div>
+        <div class="color-item">
+          <label>边框色</label>
+          <input id="theme_border_color" type="color" value="#dddddd">
+        </div>
+      </div>
+
+      <div class="theme-hint">修改颜色后页面将实时生效，点击"保存设置"后重启程序或切换页面时保持生效</div>
+    </div>
+
+    <div class="card preview">
+      <h2>当前壁纸预览</h2>
+      <img id="previewImg" src="" alt="壁纸预览" style="display:none;">
+      <div id="previewEmpty" style="padding:40px;text-align:center;color:#999;">暂无壁纸，点击"立即换壁纸"生成</div>
+      <div class="keywords" id="previewKeywords"></div>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

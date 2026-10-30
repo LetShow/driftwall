@@ -1,0 +1,49 @@
+{
+  "name": "driftwall",
+  "version": "1.0.0",
+  "description": "Driftwall · AI 随机壁纸引擎：LLM 生成提示词 → 文生图 → 设为桌面壁纸，并按你的喜好自我进化",
+  "main": "main.js",
+  "scripts": {
+    "start": "chcp 65001 >nul && electron .",
+    "pack": "electron-builder"
+  },
+  "build": {
+    "appId": "com.driftwall.app",
+    "productName": "Driftwall",
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**/*",
+      "package.json",
+      "!db/**/*",
+      "!images/**/*",
+      "!temp/**/*",
+      "!preload/**/*",
+      "!dist/**/*",
+      "!test/**/*",
+      "!*.md"
+    ]
+  },
+  "keywords": [
+    "wallpaper",
+    "electron",
+    "ai",
+    "llm",
+    "text-to-image",
+    "wallpaper-engine",
+    "windows",
+    "desktop"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "node-cron": "^3.0.0",
+    "sql.js": "^1.9.0",
+    "wallpaper": "^7.3.1"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.0.0"
+  }
+}
