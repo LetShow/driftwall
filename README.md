@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="build/icon.png" width="120" alt="Driftwall icon">
+</p>
+
 # Driftwall · AI 随机壁纸引擎
 
 > 让桌面自己漂移成一片风景。LLM 写提示词，文生图出图，一键变壁纸，再按你的喜好自我进化。
@@ -159,8 +163,9 @@ npm run pack
 ## 🗺️ Roadmap
 
 - [ ] 打开设置页时展示「模型名」输入框，去掉代码里的硬编码
+- [x] 应用图标（`build/icon.ico`，由应用内置的文生图模型生成）
 - [ ] API Key 简单加密存储 / 接入系统凭据管理器
-- [ ] 应用图标与代码签名，减少杀毒软件误报
+- [ ] 代码签名，减少杀毒软件误报
 - [ ] 自动更新（electron-updater）
 - [ ] macOS / Linux 支持
 - [ ] 中文提示词直出与本地化界面
