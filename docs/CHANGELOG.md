@@ -109,13 +109,16 @@
 - 打包产物（`dist-test\win-unpacked\Driftwall.exe`，输出目录与 `dist/` 隔离以免覆盖用户数据）实跑：
   - asar 内包含 `lib/adapters.js`，5 页界面与 Profile IPC 正常
   - 空配置下测试连接返回 `接口地址为空`，不抛异常
+- 发布产物 `dist-release\Driftwall-1.1.0-portable.exe`（77,181,741 字节）实跑：
+  - 双击启动成功，进程存活
+  - 远程调试端口列出两个窗口：`index.html`（设置）与 `float.html`（悬浮按钮），均从临时解包的 `app.asar` 加载
+  - `dataRoot` 仍落在 exe 同目录的临时解包路径下，未污染仓库内 `dist/`
 
 ### 未验证项
 - Gemini / Anthropic / 豆包 / 通义 / ComfyUI 原生协议：无 Key，**未实测**
 - Azure OpenAI：无订阅，**未实测**
 - SD WebUI：本地未部署，**未实测**；其 base64 解析仅经 mock 验证
 - 二进制响应、异步轮询、下载携带鉴权：仅经 mock 验证，未对接真实服务商
-- `dist\Driftwall-1.1.0-portable.exe` portable 外壳本身未双击验证
 - Windows 10 实机、125% / 150% 缩放下的新设置页布局
 
 ---
