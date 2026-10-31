@@ -1,10 +1,12 @@
-const { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, Menu, shell } = require("electron");
 const path = require("path");
 const url = require("url");
 const fs = require("fs");
+const util = require("util");
 const axios = require("axios");
 const cron = require("node-cron");
 const initSqlJs = require("sql.js");
+const adapters = require("./lib/adapters");
 
 // 运行时数据目录：开发时用项目目录；打包后放在 exe 同级目录（而不是 app.asar 内部），
 // 这样数据库/图片仍可读写，拷走整个文件夹即可迁移（绿色软件）
@@ -21,6 +23,82 @@ const dbPath = path.join(dbDir, "wallpaper.db");
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true });
 }
+
+// ==================== 日志落盘 ====================
+// 便携版没有控制台，日志同时写入 dataRoot/logs/app-YYYY-MM-DD.log，
+// 方便用户回传、也方便事后排查托盘/接口问题。日志中的 Key 一律脱敏。
+const logDir = path.join(dataRoot, "logs");
+const LOG_RETENTION_DAYS = 7;
+let logFilePath = null;
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// 2026-10-30：日志脱敏。覆盖 sk-xxx、Bearer xxx、?key=xxx、Profile JSON 里的 "key":"xxx"
+function redactSecrets(text) {
+  return String(text)
+    .replace(/Bearer\s+[A-Za-z0-9._\-]+/gi, "Bearer ***")
+    .replace(/\b(sk|ak|pk)-[A-Za-z0-9._\-]{4,}/gi, "$1-***")
+    .replace(/([?&](?:key|api_key|api-key|access_token|token)=)[^&\s]+/gi, "$1***")
+    .replace(
+      /("?(?:api_?key|image_key|authorization|key|token|secret)"?\s*[:=]\s*"?)[^",\s}]+/gi,
+      "$1***",
+    );
+}
+
+// 只保留最近 7 天日志
+function cleanOldLogs() {
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(logDir)) {
+      if (!/^app-\d{4}-\d{2}-\d{2}\.log$/.test(name)) continue;
+      const full = path.join(logDir, name);
+      const stat = fs.statSync(full);
+      if (now - stat.mtimeMs > LOG_RETENTION_DAYS * 24 * 60 * 60 * 1000) {
+        fs.unlinkSync(full);
+      }
+    }
+  } catch (e) {
+    // 清理失败不影响主流程
+  }
+}
+
+function setupLogging() {
+  try {
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    const d = new Date();
+    logFilePath = path.join(
+      logDir,
+      `app-${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}.log`,
+    );
+    cleanOldLogs();
+  } catch (e) {
+    logFilePath = null;
+  }
+
+  const writeLine = (level, args) => {
+    if (!logFilePath) return;
+    try {
+      const line = `${new Date().toISOString()} [${level}] ${redactSecrets(
+        util.format(...args),
+      )}\n`;
+      fs.appendFileSync(logFilePath, line, "utf8");
+    } catch (e) {
+      // 写日志失败时静默，避免递归
+    }
+  };
+
+  for (const level of ["log", "info", "warn", "error"]) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      original(...args);
+      writeLine(level.toUpperCase(), args);
+    };
+  }
+}
+
+setupLogging();
 
 // 全局数据库对象（sql.js 异步初始化）
 let db = null;
@@ -92,6 +170,41 @@ async function initDatabase() {
     console.log("[DB] 创建新数据库:", dbPath);
   }
   dbReady = true;
+  migrateApiProfiles();
+}
+
+// 把旧版的四个接口字段迁移成两个 Profile（ADR-011）。
+// 迁移时保留 Agnes 的 4K + ratio + extra_body 参数，避免升级后现有服务直接不可用。
+function migrateApiProfiles() {
+  try {
+    if (getSetting("llm_profile")) return;
+    const llm = adapters.normalizeProfile("llm", {
+      template: "openai-compatible",
+      url: getSetting("model_url"),
+      key: getSetting("api_key"),
+      model: "agnes-3.0-flash",
+    });
+    const image = adapters.normalizeProfile("image", {
+      template: "openai-compatible",
+      url: getSetting("image_url"),
+      key: getSetting("image_key"),
+      model: "agnes-image-2.5-flash",
+      sizeMode: "none",
+      responsePath: "data[0].url",
+      body: {
+        model: "{{model}}",
+        prompt: "{{prompt}}",
+        size: "4K",
+        ratio: "{{ratio}}",
+        extra_body: { response_format: "url" },
+      },
+    });
+    setSetting("llm_profile", JSON.stringify(llm));
+    setSetting("image_profile", JSON.stringify(image));
+    console.log("[配置] 已把旧的接口设置迁移为 Profile");
+  } catch (e) {
+    console.error("[配置] 迁移接口设置失败:", e.message);
+  }
 }
 
 // 持久化数据库到文件
@@ -134,8 +247,8 @@ let tray = null;
 
 function createMainWindow() {
   mainWin = new BrowserWindow({
-    width: 900,
-    height: 700,
+    width: 1000,
+    height: 720,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -235,15 +348,19 @@ function createFloatWindow() {
   floatWin.winH = winH;
 }
 
-// 打开主设置窗口（从悬浮按钮的“设置”按钮或托盘菜单进入）
-ipcMain.on("open-settings", () => {
+// 显示主设置窗口（悬浮按钮、托盘菜单、第二次启动都走这里）
+function showSettingsWindow() {
   if (mainWin && !mainWin.isDestroyed()) {
+    if (mainWin.isMinimized()) mainWin.restore();
     mainWin.show();
     mainWin.focus();
   } else {
     createMainWindow();
   }
-});
+}
+
+// 打开主设置窗口（从悬浮按钮的“设置”按钮或托盘菜单进入）
+ipcMain.on("open-settings", showSettingsWindow);
 
 // 悬浮窗拖动：移动到新位置（限制在显示器内），拖动结束时才持久化
 ipcMain.on("move-float", (event, x, y, persist) => {
@@ -331,6 +448,14 @@ function notifyFloatCurrentImage() {
   // 主设置窗口同步收到，用于“当前壁纸预览”
   if (mainWin && !mainWin.isDestroyed()) {
     mainWin.webContents.send("current-image", image);
+  }
+}
+
+// 2026-10-30：托盘操作后让悬浮窗给出与按钮点击一致的提示
+function notifyFloatHint(message, kind) {
+  if (!message) return;
+  if (floatWin && !floatWin.isDestroyed()) {
+    floatWin.webContents.send("float-hint", { message, kind: kind || "" });
   }
 }
 
@@ -636,38 +761,226 @@ function buildPromptRequest(seed, subjectHint) {
   return lines.join("\n");
 }
 
+// ==================== 接口 Profile（ADR-011） ====================
+
+function profileSettingKey(role) {
+  return role === "llm" ? "llm_profile" : "image_profile";
+}
+
+// 读取并收敛成完整 profile；没存过时返回当前模板的默认值
+function getProfile(role) {
+  let raw = "";
+  try {
+    raw = getSetting(profileSettingKey(role));
+  } catch (e) {
+    raw = "";
+  }
+  return adapters.normalizeProfile(role, raw || { template: adapters.templateIds(role)[0] });
+}
+
+function saveProfile(role, profile) {
+  const normalized = adapters.normalizeProfile(role, profile || {});
+  setSetting(profileSettingKey(role), JSON.stringify(normalized));
+  // 用户刚改完配置，之前的失败退避不再有意义
+  resetPreloadBackoff();
+  return normalized;
+}
+
+function profileTimeoutMs(profile, settingKey, defaultSec) {
+  const own = Number(profile && profile.timeoutSec);
+  if (own > 0) return own * 1000;
+  try {
+    return getTimeoutSetting(settingKey, defaultSec);
+  } catch (e) {
+    return defaultSec * 1000;
+  }
+}
+
+// 从各种错误响应里抠出人能看懂的一句话
+function getErrorMessageFromResponse(data) {
+  if (data === undefined || data === null) return "";
+  if (Buffer.isBuffer(data)) return getErrorMessageFromResponse(data.toString("utf8"));
+  if (typeof data === "string") {
+    const text = data.trim();
+    if (!text) return "";
+    try {
+      return getErrorMessageFromResponse(JSON.parse(text));
+    } catch (e) {
+      return text.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").slice(0, 300);
+    }
+  }
+  if (typeof data !== "object") return String(data).slice(0, 300);
+  const candidates = [
+    data.error && (data.error.message || data.error.msg || data.error),
+    data.message,
+    data.msg,
+    data.detail,
+    data.error_message,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim().slice(0, 300);
+  }
+  try {
+    return JSON.stringify(data).slice(0, 300);
+  } catch (e) {
+    return "";
+  }
+}
+
+function describeApiError(err) {
+  if (!err) return "未知错误";
+  if (err.isApiError && err.message) return redactSecrets(err.message);
+  const status = err.response && err.response.status;
+  if (status) {
+    const detail = getErrorMessageFromResponse(err.response.data);
+    const suffix = detail ? `：${detail}` : "";
+    return redactSecrets(`接口返回 ${status}${suffix}`);
+  }
+  const code = err.code || "";
+  if (code === "ECONNABORTED" || code === "ETIMEDOUT" || /timeout/i.test(err.message || "")) {
+    return "请求超时";
+  }
+  if (code === "ECONNREFUSED") return "无法连接接口地址（连接被拒绝）";
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "接口域名解析失败，请检查地址";
+  if (code === "ECONNRESET") return "连接被重置";
+  if (code === "ERR_NETWORK") return "网络不可用";
+  if (code === "ERR_CANCELED") return "请求已取消";
+  return redactSecrets((err.message || String(err)).slice(0, 300));
+}
+
+function reportApiError(role, message, err) {
+  console.error(`[接口] ${message}`, err && err.stack ? err.stack : "");
+  if (mainWin && !mainWin.isDestroyed()) {
+    mainWin.webContents.send("api-error", {
+      role,
+      message,
+      time: Date.now(),
+    });
+  }
+}
+
+// 所有 HTTP 请求的统一入口：超时 / 网络 / 5xx 自动重试一次，4xx 直接抛
+async function apiRequest(config, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : 60000;
+  const retry = options.retry !== false;
+  const run = () =>
+    axios.request({
+      method: "GET",
+      ...config,
+      timeout: timeoutMs,
+    });
+
+  try {
+    return await run();
+  } catch (err) {
+    if (retry && adapters.isRetryableError(err)) {
+      notifyProgress(`请求失败，正在重试一次：${describeApiError(err)}`);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      return await run();
+    }
+    throw err;
+  }
+}
+
+// 兼容 JSON 与二进制响应：二进制会包成 { __binary, contentType }
+// 具体实现放在 lib/adapters.js，便于 test/ 离线验证
+function parseResponseBody(resp) {
+  return adapters.parseResponseBody(resp);
+}
+
+async function downloadImage(url, profile, timeoutMs) {
+  // “下载时携带鉴权”同时带上自定义请求头与认证头（部分图床要求同一套头）
+  const headers = profile.downloadWithAuth
+    ? { ...(profile.headers || {}), ...adapters.authHeaders(profile) }
+    : {};
+  const resp = await apiRequest(
+    { url, method: "GET", headers, responseType: "arraybuffer" },
+    { timeoutMs },
+  );
+  const contentType = (resp.headers && resp.headers["content-type"]) || "";
+  const buffer = Buffer.isBuffer(resp.data) ? resp.data : Buffer.from(resp.data || []);
+  if (buffer.length === 0) throw new Error("下载到的图片为空");
+  return { buffer, contentType };
+}
+
+// 按 Content-Type / 文件魔数写文件，不再一律 .png
+function writeImageFile(saveDir, buffer, contentType) {
+  if (!buffer || buffer.length === 0) throw new Error("图片内容为空");
+  const ext = adapters.guessImageExtension(contentType, buffer);
+  const fileName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const filePath = path.join(saveDir, fileName);
+  fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
+
+async function materializeImage(image, saveDir, profile, timeoutMs) {
+  if (image.kind === "url") {
+    notifyProgress("图片生成成功，正在下载...");
+    const downloaded = await downloadImage(image.value, profile, timeoutMs);
+    return writeImageFile(saveDir, downloaded.buffer, downloaded.contentType);
+  }
+  if (image.kind === "base64") {
+    notifyProgress("图片生成成功，正在解码 base64...");
+    return writeImageFile(saveDir, Buffer.from(image.value, "base64"), "");
+  }
+  if (image.kind === "bytes") {
+    return writeImageFile(saveDir, image.value, image.contentType || "");
+  }
+  throw new Error("无法识别的图片返回格式");
+}
+
+// 异步任务轮询
+async function pollImage(profile, taskId, timeoutMs, quiet) {
+  const poll = profile.poll || {};
+  const intervalMs = Math.max(1000, Number(poll.intervalSec || 5) * 1000);
+  const totalMs = Math.max(10000, Number(poll.timeoutSec || 300) * 1000);
+  const deadline = Date.now() + totalMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    const req = adapters.planPollRequest(profile, taskId);
+    const resp = await apiRequest(req, { timeoutMs: Math.min(timeoutMs, 60000) });
+    const data = parseResponseBody(resp);
+    const step = adapters.pollStep(profile, data);
+    if (step.state === "success") return step.image;
+    if (step.state === "failed") {
+      throw new Error(`生成任务失败（状态：${step.status || "unknown"}）`);
+    }
+    if (!quiet) {
+      notifyProgress(`图片生成中（状态：${step.status || "等待中"}）...`);
+    }
+  }
+  throw new Error(`等待图片生成超时（${Math.round(totalMs / 1000)} 秒）`);
+}
+
 // 调用 LLM 生成提示词正文（方法 A / 方法 B 共用），返回原始文本
 async function callPromptLLM(userContent) {
-  const url = getSetting("model_url");
-  const key = getSetting("api_key");
-  if (!url || !key) {
-    throw new Error("请先在设置里填写 LLM 模型网址和 Key");
+  const profile = getProfile("llm");
+  if (!profile.url) {
+    throw new Error("请先在「模型接入」里填写 LLM 接口地址");
   }
-  const llmTimeout = getTimeoutSetting("llm_timeout", 120);
-  const resp = await axios.post(
-    url,
+
+  const messages = [
     {
-      model: "agnes-3.0-flash",
-      messages: [
-        {
-          role: "system",
-          content:
-            "你是一个壁纸提示词生成助手。严格遵守用户给出的风格约束，只输出提示词正文和 KEYWORDS 行，不要输出客套话或解释。每次都要给出与之前完全不同的创意。",
-        },
-        { role: "user", content: userContent },
-      ],
-      max_tokens: 512,
-      temperature: 1.0,
+      role: "system",
+      content:
+        "你是一个壁纸提示词生成助手。严格遵守用户给出的风格约束，只输出提示词正文和 KEYWORDS 行，不要输出客套话或解释。每次都要给出与之前完全不同的创意。",
     },
-    {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      timeout: llmTimeout,
-    },
-  );
-  return resp.data.choices[0].message.content;
+    { role: "user", content: userContent },
+  ];
+
+  const req = adapters.planRequest("llm", profile, { messages });
+  const timeoutMs = profileTimeoutMs(profile, "llm_timeout", 120);
+
+  try {
+    const resp = await apiRequest(req, { timeoutMs });
+    const data = parseResponseBody(resp);
+    return adapters.extractText(data, profile);
+  } catch (err) {
+    const message = `LLM 调用失败：${describeApiError(err)}`;
+    reportApiError("llm", message, err);
+    throw new Error(message);
+  }
 }
 
 // 生成提示词（方法 B：库空时的迫切生成）
@@ -685,8 +998,7 @@ async function generatePrompt() {
 
 // 文生图（调用用户配置的服务）
 async function generateImage(prompt) {
-  const url = getSetting("image_url");
-  const key = getSetting("image_key");
+  const profile = getProfile("image");
   const saveDir = getSetting("image_dir") || path.join(dataRoot, "images");
 
   if (!fs.existsSync(saveDir)) {
@@ -694,72 +1006,124 @@ async function generateImage(prompt) {
     console.log("[预生成] 创建图片保存目录:", saveDir);
   }
 
-  if (!url || !key) {
-    throw new Error("请先在设置里填写文生图模型网址和 Key");
+  if (!profile.url) {
+    throw new Error("请先在「模型接入」里填写文生图接口地址");
   }
 
-  console.log("[预生成] 文生图 API 网址:", url);
-  console.log("[预生成] 图片保存目录:", saveDir);
+  const wallpaperDisplaySetting = getSetting("wallpaper_display", "primary");
+  const targetRatio = getDisplayRatio(wallpaperDisplaySetting);
+  console.log(
+    `[预生成] 文生图模板: ${profile.template}, 显示器: ${wallpaperDisplaySetting}, 长宽比: ${targetRatio}`,
+  );
+
+  const req = adapters.planRequest("image", profile, {
+    prompt,
+    ratio: targetRatio,
+  });
+  const timeoutMs = profileTimeoutMs(profile, "image_timeout", 180);
 
   notifyProgress("正在调用文生图 API...");
 
-  const imgTimeout = getTimeoutSetting("image_timeout", 180);
+  const startedAt = Date.now();
+  try {
+    const resp = await apiRequest(
+      { ...req, responseType: "arraybuffer" },
+      { timeoutMs },
+    );
+    console.log(`[预生成] 文生图 API 已响应，耗时 ${Date.now() - startedAt}ms`);
 
-  // 获取用户设置的壁纸生成显示器
-  const wallpaperDisplaySetting = getSetting("wallpaper_display", "primary");
-  const targetRatio = getDisplayRatio(wallpaperDisplaySetting);
-  console.log(`[预生成] 壁纸生成显示器设置: ${wallpaperDisplaySetting}, 长宽比: ${targetRatio}`);
-  
-  // 调用文生图 API（OpenAI 兼容格式）
-  const sApi = Date.now();
-  console.log(`[预生成] 发送文生图 API 请求 (超时 ${imgTimeout}ms)...`);
-  const resp = await axios.post(
-    url,
-    {
-      model: "agnes-image-2.5-flash",
-      prompt,
-      size: "4K",
-      ratio: targetRatio,
-      extra_body: { response_format: "url" },
-    },
-    {
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      timeout: imgTimeout,
-    },
-  );
+    const data = parseResponseBody(resp);
+    let image;
+    if (data && data.__binary) {
+      image = { kind: "bytes", value: data.__binary, contentType: data.contentType };
+    } else {
+      console.log(
+        "[预生成] API 响应摘要:",
+        JSON.stringify(data).slice(0, 300),
+      );
+      image = adapters.extractImage(data, profile);
+    }
 
-  console.log(`[预生成] 文生图 API 响应，耗时 ${Date.now() - sApi}ms`);
-  console.log(
-    "[预生成] API 响应数据:",
-    JSON.stringify(resp.data).substring(0, 200) + "...",
-  );
+    if (image.kind === "task") {
+      notifyProgress("已提交生成任务，等待结果...");
+      image = await pollImage(profile, image.taskId, timeoutMs);
+    }
 
-  const imageUrl = resp.data.data[0].url;
-  console.log("[预生成] 图片 URL:", imageUrl);
-  notifyProgress("图片生成成功，正在下载...");
-
-  // 下载图片
-  const sDown = Date.now();
-  console.log("[预生成] 开始下载图片...");
-  const imgResp = await axios.get(imageUrl, {
-    responseType: "arraybuffer",
-    timeout: imgTimeout,
-  });
-  console.log(
-    `[预生成] 图片下载完成，耗时 ${Date.now() - sDown}ms，数据大小: ${imgResp.data.length} 字节`,
-  );
-
-  const fileName = Date.now() + ".png";
-  const filePath = path.join(saveDir, fileName);
-  fs.writeFileSync(filePath, Buffer.from(imgResp.data));
-  console.log("[预生成] 图片文件已写入:", filePath);
-
-  notifyProgress("图片下载完成:", filePath);
-  return filePath;
+    const filePath = await materializeImage(image, saveDir, profile, timeoutMs);
+    console.log("[预生成] 图片文件已写入:", filePath);
+    notifyProgress("图片已保存:" + filePath);
+    return filePath;
+  } catch (err) {
+    const message = `文生图调用失败：${describeApiError(err)}`;
+    reportApiError("image", message, err);
+    throw new Error(message);
+  }
 }
+
+// 测试连接：LLM 发一条极短消息；文生图会真实生成一张（不保存），用于验证鉴权与解析路径
+async function testConnection(role, rawProfile) {
+  const profile = adapters.normalizeProfile(
+    role,
+    rawProfile || getProfile(role),
+  );
+  const start = Date.now();
+  const result = (extra) => ({
+    success: extra.success,
+    elapsedMs: Date.now() - start,
+    detail: extra.detail || "",
+    status: extra.status || 0,
+    errorCode: extra.errorCode || "",
+  });
+
+  try {
+    if (!profile.url) throw new Error("接口地址为空");
+
+    if (role === "llm") {
+      const req = adapters.planRequest("llm", profile, {
+        messages: [{ role: "user", content: "Reply with the single word OK." }],
+      });
+      const resp = await apiRequest(req, { timeoutMs: 30000, retry: false });
+      const text = adapters.extractText(parseResponseBody(resp), profile);
+      return result({ success: true, detail: text.slice(0, 200) });
+    }
+
+    const req = adapters.planRequest("image", profile, {
+      prompt: "a tiny blue circle on a plain white background, flat icon",
+      ratio: "16:9",
+    });
+    const timeoutMs = profileTimeoutMs(profile, "image_timeout", 180);
+    const resp = await apiRequest(
+      { ...req, responseType: "arraybuffer" },
+      { timeoutMs, retry: false },
+    );
+    const data = parseResponseBody(resp);
+    let image =
+      data && data.__binary
+        ? { kind: "bytes", value: data.__binary, contentType: data.contentType }
+        : adapters.extractImage(data, profile);
+    if (image.kind === "task") {
+      image = await pollImage(profile, image.taskId, timeoutMs, true);
+    }
+
+    let detail = "";
+    if (image.kind === "url") {
+      detail = `返回图片 URL：${String(image.value).slice(0, 150)}`;
+    } else if (image.kind === "base64") {
+      detail = `返回 base64 图片（约 ${Math.round((image.value.length * 3) / 4 / 1024)} KB）`;
+    } else {
+      detail = `返回二进制图片（约 ${Math.round(image.value.length / 1024)} KB）`;
+    }
+    return result({ success: true, detail });
+  } catch (err) {
+    return result({
+      success: false,
+      detail: describeApiError(err),
+      status: (err.response && err.response.status) || 0,
+      errorCode: err.code || "",
+    });
+  }
+}
+
 
 // 清理提示词再发给文生图：去掉 KEYWORDS 行、开场白和 markdown 符号，
 // 避免图片模型把 "Here is..." 之类的文字渲染进画面
@@ -946,6 +1310,42 @@ ipcMain.handle("ignore-image", (event, imageId) => {
 ipcMain.handle("get-setting", (event, key) => getSetting(key));
 ipcMain.handle("set-setting", (event, key, value) => setSetting(key, value));
 
+// ==================== 接口 Profile（ADR-011） ====================
+
+// 设置页渲染下拉框/高级区所需元数据
+ipcMain.handle("get-profile-meta", () => ({
+  templates: {
+    llm: adapters.listTemplates("llm"),
+    image: adapters.listTemplates("image"),
+  },
+  authTypes: adapters.AUTH_TYPES,
+}));
+
+// 切换模板时填充默认值
+ipcMain.handle("get-profile-defaults", (event, role, template) =>
+  adapters.defaultProfile(role, template),
+);
+
+ipcMain.handle("get-profiles", () => ({
+  llm: getProfile("llm"),
+  image: getProfile("image"),
+}));
+
+ipcMain.handle("save-profile", (event, role, profile) => {
+  if (role !== "llm" && role !== "image") {
+    return { success: false, error: "未知的配置角色" };
+  }
+  try {
+    return { success: true, profile: saveProfile(role, profile) };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle("test-connection", (event, role, profile) =>
+  testConnection(role, profile),
+);
+
 // 获取壁纸生成显示器设置
 ipcMain.handle("get-wallpaper-display", () => {
   return getSetting("wallpaper_display", "primary");
@@ -1082,7 +1482,61 @@ let preloadConfig = {
   idleMinutes: 5, // 空闲多少分钟后开始预生成
   isGenerating: false, // 是否正在生成中
   lastFailTime: 0, // 上次失败时间戳
+  failCount: 0, // 连续失败次数（成功后清零）
+  retryDelayMs: 0, // 当前退避时长
+  pauseUntil: 0, // 退避结束时间戳
+  lastError: "", // 最近一次失败原因（给设置页显示）
 };
+
+// 失败退避：60 秒 → 5 分钟 → 15 分钟（ADR-011）
+const PRELOAD_BACKOFF_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
+
+// 启动时从 settings 恢复预生成配置。
+// 之前只靠界面保存时调用 set-preload-config，重启后会退回默认值（界面显示已关闭、后台仍在跑）。
+function loadPreloadConfig() {
+  try {
+    const enabledVal = getSetting("preload_enabled");
+    preloadConfig.enabled = enabledVal === "" ? true : enabledVal !== "false";
+    preloadConfig.maxCount = parseInt(getSetting("preload_max"), 10) || 10;
+    preloadConfig.idleMinutes = parseInt(getSetting("preload_idle"), 10) || 5;
+  } catch (e) {
+    console.error("[预生成] 读取配置失败:", e.message);
+  }
+}
+
+function notifyPreloadStatus() {
+  if (mainWin && !mainWin.isDestroyed()) {
+    mainWin.webContents.send("preload-status", {
+      isGenerating: preloadConfig.isGenerating,
+      failCount: preloadConfig.failCount,
+      retryDelayMs: preloadConfig.retryDelayMs,
+      pauseUntil: preloadConfig.pauseUntil,
+      lastError: preloadConfig.lastError,
+    });
+  }
+}
+
+function schedulePreloadBackoff(error) {
+  const index = Math.min(preloadConfig.failCount, PRELOAD_BACKOFF_MS.length - 1);
+  const delay = PRELOAD_BACKOFF_MS[index];
+  preloadConfig.failCount += 1;
+  preloadConfig.retryDelayMs = delay;
+  preloadConfig.pauseUntil = Date.now() + delay;
+  preloadConfig.lastFailTime = Date.now();
+  preloadConfig.lastError = String(error || "未知错误");
+  console.log(
+    `[预生成] 失败，${Math.round(delay / 1000)} 秒后再试：${preloadConfig.lastError}`,
+  );
+  notifyPreloadStatus();
+}
+
+function resetPreloadBackoff() {
+  preloadConfig.failCount = 0;
+  preloadConfig.retryDelayMs = 0;
+  preloadConfig.pauseUntil = 0;
+  preloadConfig.lastError = "";
+  notifyPreloadStatus();
+}
 
 // 空闲检测（通过 IPC 从渲染进程接收用户活动）
 let lastActivityTime = Date.now();
@@ -1099,15 +1553,8 @@ function getIdleMinutes() {
 // 检查是否应该开始预生成
 function shouldPreload() {
   if (!preloadConfig.enabled) return false;
-
-  // 如果上次失败，至少等待 60 秒才再试，避免快速死循环
-  const failInterval = Date.now() - preloadConfig.lastFailTime;
-  if (failInterval < 60000) {
-    return false;
-  }
-
-  const idle = getIdleMinutes();
-  return idle >= preloadConfig.idleMinutes;
+  if (preloadConfig.pauseUntil > Date.now()) return false;
+  return getIdleMinutes() >= preloadConfig.idleMinutes;
 }
 
 // 获取当前预生成库图片数量（status='normal' 且未被显示过的，作为候选库）
@@ -1177,10 +1624,8 @@ async function preloadLoop() {
   if (!shouldPreload()) return;
 
   preloadConfig.isGenerating = true;
+  notifyPreloadStatus();
   console.log("[预生成] 开始后台预生成图片...");
-
-  let failCount = 0;
-  const maxFailCount = 3; // 连续失败 3 次后暂停
 
   try {
     while (getPreloadCount() < preloadConfig.maxCount && shouldPreload()) {
@@ -1192,26 +1637,16 @@ async function preloadLoop() {
         console.log(
           `[预生成] 已生成一张，当前库存：${getPreloadCount()}/${preloadConfig.maxCount}`,
         );
-        failCount = 0; // 成功后重置失败计数
+        if (preloadConfig.failCount > 0) resetPreloadBackoff();
       } else {
-        failCount++;
-        preloadConfig.lastFailTime = Date.now(); // 记录失败时间，防止快速重复触发
-        console.error(
-          `[预生成] 单张失败（第 ${failCount} 次）：${result.error}`,
-        );
-        if (failCount >= maxFailCount) {
-          console.error(
-            "[预生成] 连续失败 3 次，暂停预生成，请检查模型网址和 Key 是否正确",
-          );
-          break;
-        }
-        // 失败后等待 60 秒再继续，避免快速死循环
-        console.log("[预生成] 等待 60 秒后重试...");
-        await new Promise((resolve) => setTimeout(resolve, 60000));
+        // 失败后按 60s → 5min → 15min 退避，由 shouldPreload() 拦截下次尝试
+        schedulePreloadBackoff(result.error);
+        break;
       }
     }
   } finally {
     preloadConfig.isGenerating = false;
+    notifyPreloadStatus();
   }
 }
 
@@ -1243,6 +1678,22 @@ ipcMain.handle("set-preload-config", (event, config) => {
   saveDatabase();
   startPreloadCheck();
   return preloadConfig;
+});
+
+// 预生成运行状态（含退避信息，设置页展示“已暂停/下次尝试时间”）
+ipcMain.handle("get-preload-status", () => ({
+  enabled: preloadConfig.enabled,
+  isGenerating: preloadConfig.isGenerating,
+  failCount: preloadConfig.failCount,
+  retryDelayMs: preloadConfig.retryDelayMs,
+  pauseUntil: preloadConfig.pauseUntil,
+  lastError: preloadConfig.lastError,
+}));
+
+// 手动恢复预生成（用户在设置页点“立即重试”）
+ipcMain.handle("reset-preload-backoff", () => {
+  resetPreloadBackoff();
+  return { success: true };
 });
 
 // 立即换壁纸
@@ -1278,34 +1729,100 @@ function stopAutoChange() {
   }
 }
 
-// 使用内联 SVG 生成托盘图标，避免依赖外部图片文件
-function createTrayIcon() {
-  const svg =
-    '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">' +
-    '<rect width="16" height="16" rx="3" fill="#007acc"/>' +
-    '<path d="M4 5h8l-4 4 z" fill="white"/>' +
-    "</svg>";
-  return nativeImage.createFromDataURL(
-    "data:image/svg+xml;base64," + Buffer.from(svg).toString("base64")
-  );
+// ==================== 托盘 ====================
+// 2026-10-30 修复：原来用内联 SVG 生成图标，而 nativeImage 不支持 SVG，
+// 得到的是 0×0 空图；new Tray(空图) 又不报错，结果就是“托盘没图标、退不出去”。
+// 现在优先加载打包进 asar 的 build/icon.ico，失败时回退到内置 PNG，两种情况都写日志。
+const FALLBACK_TRAY_ICON_PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAoElEQVRYhe2XQQ6AIAwErfFH+jo96+v0TXgxARG0bQhrE/ZYKJ1uCKHU5TTvLrum0TZRKnwPli7KgPEAtYpHEAQpHkD0kMKB4AAEs/8S3AE4wKBNdOv4iNFyiM+BO6ACSHX/Fi8OUFJigK8upS7YcoDbncQFWw5AAaSXi7vfhgOaB4abZ8MBKIDWfm5++xG1bzkc4CejWW2I5HAaq9J4fgJVyTRXgGwOKAAAAABJRU5ErkJggg==";
+
+function loadTrayIcon() {
+  const candidates = [
+    path.join(__dirname, "build", "icon.ico"),
+    path.join(__dirname, "build", "icon.png"),
+  ];
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) {
+        console.warn("[托盘] 图标文件不存在:", file);
+        continue;
+      }
+      let img = nativeImage.createFromPath(file);
+      if (img.isEmpty()) {
+        console.warn("[托盘] 图标加载结果为空:", file);
+        continue;
+      }
+      const size = img.getSize();
+      if (size.width > 32) {
+        img = img.resize({ width: 32, height: 32, quality: "best" });
+      }
+      console.log(`[托盘] 图标已加载: ${file} (${size.width}x${size.height})`);
+      return img;
+    } catch (e) {
+      console.error("[托盘] 图标加载异常:", file, e.message);
+    }
+  }
+  console.warn("[托盘] 没有可用的图标文件，使用内置兜底图标");
+  return nativeImage.createFromDataURL(FALLBACK_TRAY_ICON_PNG);
 }
 
-// 创建托盘图标。主窗口关闭后程序仍常驻，用户可通过托盘打开设置或退出。
-function createTray() {
-  if (tray) return;
-  tray = new Tray(createTrayIcon());
-  const contextMenu = Menu.buildFromTemplate([
+// 当前壁纸记录，用于决定托盘菜单项是否可点
+function getRatingRow() {
+  if (!dbReady || !currentImageId) return null;
+  try {
+    return dbQuery("SELECT id, status FROM images WHERE id = ?", [currentImageId]);
+  } catch (e) {
+    console.error("[托盘] 读取当前壁纸失败:", e.message);
+    return null;
+  }
+}
+
+// 托盘上的喜欢/不喜欢：复用与悬浮窗完全相同的 rateImage 逻辑
+function trayRateImage(type) {
+  const res = rateImage(currentImageId, type);
+  console.log("[托盘] 评价:", type, res && res.message);
+  notifyFloatHint(res && res.message, res && res.success ? "ok" : "err");
+  return res;
+}
+
+async function trayNextWallpaper() {
+  if (isChangingWallpaper) {
+    notifyFloatHint("正在生成壁纸，请稍候", "err");
+    return;
+  }
+  notifyFloatHint("正在切换壁纸…");
+  try {
+    const res = await changeWallpaper();
+    if (!res || !res.success) {
+      notifyFloatHint((res && res.error) || "切换失败，请重试", "err");
+    }
+  } catch (e) {
+    console.error("[托盘] 下一个失败:", e.message);
+    notifyFloatHint("切换失败：" + e.message, "err");
+  }
+}
+
+// 每次右键时重新构建，保证置灰状态跟着当前壁纸走
+function buildTrayMenu() {
+  const row = getRatingRow();
+  return Menu.buildFromTemplate([
     {
-      label: "显示设置",
-      click: () => {
-        if (mainWin && !mainWin.isDestroyed()) {
-          mainWin.show();
-          mainWin.focus();
-        } else {
-          createMainWindow();
-        }
-      },
+      label: "喜欢",
+      enabled: !!row && row.status !== "liked",
+      click: () => trayRateImage("liked"),
     },
+    {
+      label: "不喜欢",
+      enabled: !!row && row.status !== "disliked",
+      click: () => trayRateImage("disliked"),
+    },
+    { type: "separator" },
+    {
+      label: "下一个",
+      enabled: !isChangingWallpaper,
+      click: trayNextWallpaper,
+    },
+    { label: "设置", click: showSettingsWindow },
     { type: "separator" },
     {
       label: "退出",
@@ -1315,33 +1832,79 @@ function createTray() {
       },
     },
   ]);
-  tray.setToolTip("Driftwall · 随机壁纸");
-  tray.setContextMenu(contextMenu);
 }
 
-app.whenReady().then(async () => {
-  await initDatabase();
-  // 不喜欢的图片存放目录
-  const tempDir = path.join(dataRoot, "temp");
-  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-  createMainWindow();
-  createFloatWindow();
-  createTray();
-  startPreloadCheck();
-  // 识别启动时的桌面壁纸（放在悬浮窗创建之后，好把结果推给它）
-  initCurrentImage();
-  // 启动自动换壁纸
-  startAutoChange();
-  // 临时文件定期清理：启动 30 秒后清一次，之后每小时检查一次
-  setTimeout(cleanTempFiles, 30 * 1000);
-  setInterval(cleanTempFiles, 60 * 60 * 1000);
+// 创建托盘图标。主窗口关闭后程序仍常驻，用户可通过托盘打开设置或退出。
+function createTray() {
+  if (tray) return;
+  try {
+    const icon = loadTrayIcon();
+    tray = new Tray(icon);
+    if (icon.isEmpty()) {
+      console.error("[托盘] 图标为空，托盘图标将不可见");
+    }
+    tray.setToolTip("Driftwall · 随机壁纸");
+    // 左键打开设置；右键弹出菜单，菜单项状态每次现算
+    tray.on("click", showSettingsWindow);
+    tray.on("right-click", () => tray.popUpContextMenu(buildTrayMenu()));
+    console.log("[托盘] 创建完成");
+  } catch (e) {
+    console.error("[托盘] 创建失败:", e.message);
+  }
+}
+
+// 打开日志目录（设置页底部的“打开日志目录”）
+ipcMain.handle("open-log-dir", async () => {
+  try {
+    if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+    const err = await shell.openPath(logDir);
+    if (err) throw new Error(err);
+    return { success: true, path: logDir };
+  } catch (e) {
+    console.error("[日志] 打开日志目录失败:", e.message);
+    return { success: false, error: e.message, path: logDir };
+  }
 });
 
-app.on("window-all-closed", () => {
-  // 不退出，后台继续运行；用户可通过托盘图标打开设置或退出
-  saveDatabase();
-});
+ipcMain.handle("get-log-dir", () => logDir);
 
-app.on("before-quit", () => {
-  saveDatabase();
-});
+// 单实例：第二次双击 exe 时唤出已有实例的设置窗口，避免多个隐形托盘和重复定时任务
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  console.log("[单实例] 已有实例在运行，本进程退出");
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    console.log("[单实例] 收到第二次启动请求，唤出设置窗口");
+    if (app.isReady()) showSettingsWindow();
+    else app.once("ready", showSettingsWindow);
+  });
+
+  app.whenReady().then(async () => {
+    await initDatabase();
+    loadPreloadConfig();
+    // 不喜欢的图片存放目录
+    const tempDir = path.join(dataRoot, "temp");
+    if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+    createMainWindow();
+    createFloatWindow();
+    createTray();
+    startPreloadCheck();
+    // 识别启动时的桌面壁纸（放在悬浮窗创建之后，好把结果推给它）
+    initCurrentImage();
+    // 启动自动换壁纸
+    startAutoChange();
+    // 临时文件定期清理：启动 30 秒后清一次，之后每小时检查一次
+    setTimeout(cleanTempFiles, 30 * 1000);
+    setInterval(cleanTempFiles, 60 * 60 * 1000);
+  });
+
+  app.on("window-all-closed", () => {
+    // 不退出，后台继续运行；用户可通过托盘图标打开设置或退出
+    saveDatabase();
+  });
+
+  app.on("before-quit", () => {
+    saveDatabase();
+  });
+}

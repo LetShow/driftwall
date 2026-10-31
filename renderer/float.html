@@ -573,6 +573,12 @@
       }
     });
 
+    // 托盘菜单操作后，主进程把提示推过来，与按钮点击的反馈保持一致
+    window.wallpaperApi.onFloatHint((payload) => {
+      if (!payload || !payload.message) return;
+      showHint(payload.message, payload.kind || '');
+    });
+
     async function init() {
       try {
         const theme = await window.wallpaperApi.getTheme();

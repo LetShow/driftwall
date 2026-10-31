@@ -90,6 +90,14 @@ npm start
 
 启动后在设置页填写两组接口信息（见下节），点「立即换壁纸」即可。
 
+### 测试
+
+```bash
+npm test
+```
+
+离线 mock 覆盖 4 种返回形态（url / b64_json / 二进制 / 异步轮询）与 4 种认证方式，不需要真实 Key。
+
 ### 打包
 
 ```bash
@@ -106,23 +114,27 @@ npm run pack
 
 ### API 接口
 
-程序调用的是 **OpenAI 兼容格式**，两组接口各填「完整 URL + API Key」：
+LLM 与文生图各存一套 **Profile**（`settings` 表的 `llm_profile` / `image_profile`）。设置页「模型接入」里选模板后填地址、Key、模型名即可：
 
-| 用途 | 默认接口 | 请求体关键字段 |
-|------|---------|---------------|
-| 生成提示词 | `POST .../v1/chat/completions` | `messages`、`max_tokens: 512`、`temperature: 1.0` |
-| 生成图片 | `POST .../v1/images/generations` | `prompt`、`size: "4K"`、`ratio: "16:9"`、`extra_body.response_format = "url"` |
+| 模板 | 适用服务 | 说明 |
+|------|---------|------|
+| OpenAI 兼容 | 各类中转站、DeepSeek、硅基流动、通义兼容模式 | 默认 `Authorization: Bearer`，读 `choices[0].message.content` / `data[0].url` |
+| Azure OpenAI | Azure 部署 | 认证头 `api-key`，地址里带 `deployments` 与 `api-version` |
+| Stable Diffusion WebUI | 本地 `/sdapi/v1/txt2img` | 返回 `images[0]` base64，无需认证 |
+| 自定义 JSON | 兜底 | 请求头、请求体、响应路径、轮询字段全部可改 |
 
-- 文生图响应需为 `{ data: [{ url: "..." }] }`，程序会再下载该 URL
-- **模型名目前写在 `main.js` 里**（`agnes-3.0-flash` / `agnes-image-2.5-flash`），接入其他服务商时请改成对应模型名
-- 提示词与图片接口的超时时间可在设置页调整（默认 120s / 180s）
+- 认证方式支持 `Bearer` / `x-api-key` / `api-key` / URL 查询参数（`?key=`）/ 无认证，可再叠加自定义请求头
+- 返回形态支持 `url` 再下载、`b64_json`、二进制图片流、异步任务轮询、Chat 回复里的 Markdown 图片链接
+- 尺寸按目标显示器比例从模板档位里就近选择；也可在「自定义尺寸」里覆盖，或选「不发送尺寸参数」
+- 超时 / 网络错误 / 5xx 自动重试 1 次；4xx 直接报错。预生成失败按 60 秒 → 5 分钟 → 15 分钟退避
+- 「测试连接」会显示耗时、返回摘要与 HTTP 状态码；文生图测试会真实生成一张小图（不保存），可能消耗额度
 
 ### 主要设置项（存于 `db/wallpaper.db` 的 `settings` 表）
 
 | 键 | 说明 |
 |----|------|
-| `model_url` / `api_key` | LLM 接口地址与 Key |
-| `image_url` / `image_key` | 文生图接口地址与 Key |
+| `llm_profile` | LLM 接口配置（JSON：模板 / 地址 / Key / 模型 / 认证 / 请求体 / 响应路径 / 轮询） |
+| `image_profile` | 文生图接口配置（同上，另含尺寸档位与下载鉴权） |
 | `interval` | 自动换壁纸间隔（分钟） |
 | `change_mode` | `random`（加权随机）/ `sequential`（按顺序） |
 | `style_explore_rate` | 风格探索比例，默认 0.5 |
@@ -130,7 +142,11 @@ npm run pack
 | `temp_clean_interval` | 临时图片保留天数，0 = 永不清理 |
 | `wallpaper_display` | 目标显示器：`primary` / `current` / 索引 |
 | `float_position` / `float_x` / `float_y` | 悬浮按钮贴边方向与坐标 |
-| `llm_timeout` / `image_timeout` | 接口超时（秒） |
+| `float_hide_delay` | 鼠标移开后自动收起延迟（毫秒） |
+| `llm_timeout` / `image_timeout` | 接口默认超时（秒），Profile 里填了 `timeoutSec` 时以 Profile 为准 |
+| `preload_enabled` / `preload_idle` / `preload_max` | 预生成开关、空闲分钟数、库存上限 |
+
+> 旧字段 `model_url` / `api_key` / `image_url` / `image_key` 会在启动时自动迁移到两份 Profile，之后不再读取。
 
 ## 🔐 数据与隐私
 
@@ -145,13 +161,17 @@ npm run pack
 .
 ├── main.js                     # 主进程：窗口、数据库、生成流程、托盘、定时任务
 ├── preload.js                  # contextBridge 安全桥接，向前端暴露 wallpaperApi
+├── lib/adapters.js             # 接口适配层：模板、请求规划、响应解析、轮询、重试判定
 ├── renderer/
-│   ├── index.html              # 设置 / 预览主界面
+│   ├── index.html              # 5 页设置界面（模型接入 / 生成与换壁 / 预生成 / 悬浮按钮 / 主题）
 │   ├── app.js                  # 主界面逻辑
 │   └── float.html              # 悬浮按钮窗口（含样式与逻辑）
+├── test/adapters.test.js       # 离线 mock 测试（4 种返回形态 × 4 种认证）
 ├── db/wallpaper.db             # SQLite 数据库（运行时生成，已忽略）
 ├── images/                     # 生成的壁纸（已忽略）
 ├── temp/                       # 被"不喜欢"的图片（已忽略）
+├── logs/                       # 运行日志，保留 7 天（已忽略）
+├── docs/CHANGELOG.md           # 按版本记录改动（现象 / 根因 / 验证）
 ├── 随机壁纸_方案.md             # 需求 / 数据库设计 / 业务流程
 ├── ADR-001-技术选型.md          # 架构决策记录
 ├── GLOSSARY.md                 # 领域术语表
@@ -161,13 +181,15 @@ npm run pack
 ## 📚 设计文档
 
 - [`随机壁纸_方案.md`](./随机壁纸_方案.md) — 完整需求、数据库设计、业务流程
-- [`ADR-001-技术选型.md`](./ADR-001-技术选型.md) — 架构决策记录（技术选型、双轨生成、权重算法、Key 存储等 10 篇）
-- [`GLOSSARY.md`](./GLOSSARY.md) — 领域术语表（风格种子、预生成库、权重、探索比例…）
+- [`ADR-001-技术选型.md`](./ADR-001-技术选型.md) — 架构决策记录（技术选型、双轨生成、权重算法、Key 存储、接口适配等 12 篇）
+- [`GLOSSARY.md`](./GLOSSARY.md) — 领域术语表（风格种子、预生成库、权重、探索比例、格式模板…）
+- [`docs/CHANGELOG.md`](./docs/CHANGELOG.md) — 按版本记录改了什么、为什么、怎么验的
 
 ## 🗺️ Roadmap
 
-- [ ] 打开设置页时展示「模型名」输入框，去掉代码里的硬编码
+- [x] 打开设置页时展示「模型名」输入框，去掉代码里的硬编码（随 1.1 的适配层完成，见 ADR-011）
 - [x] 应用图标（`build/icon.ico`，由应用内置的文生图模型生成）
+- [x] 托盘图标修复与新的托盘菜单（1.0.1，见 ADR-012）
 - [ ] API Key 简单加密存储 / 接入系统凭据管理器
 - [ ] 代码签名，减少杀毒软件误报
 - [ ] 自动更新（electron-updater）
@@ -180,7 +202,8 @@ npm run pack
 
 1. 不要提交 `db/`、`images/`、`temp/`、`dist/` 与任何包含 API Key 的文件
 2. 改动涉及流程或数据结构时，同步更新 `随机壁纸_方案.md` / `ADR`
-3. 打包产物请自行验证一遍（`npm run pack`）
+3. 每次改动在 `docs/CHANGELOG.md` 记一条：现象 / 根因 / 改动文件 / 验证方式；没实测过的写进"未验证项"
+4. 打包产物请自行验证一遍（`npm run pack`）
 
 ## ❓ 常见问题
 

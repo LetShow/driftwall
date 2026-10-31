@@ -5,6 +5,7 @@
   "main": "main.js",
   "scripts": {
     "start": "chcp 65001 >nul && electron .",
+    "test": "node --test test/adapters.test.js",
     "pack": "electron-builder"
   },
   "build": {
@@ -22,7 +23,10 @@
     "files": [
       "main.js",
       "preload.js",
+      "lib/**/*",
       "renderer/**/*",
+      "build/icon.ico",
+      "build/icon.png",
       "package.json",
       "!db/**/*",
       "!images/**/*",
