@@ -31,6 +31,8 @@ Driftwall 是一个 Windows 桌面壁纸工具：它用 LLM 生成风格各异�
 - **两种切换方式**：加权随机，或按生成先后顺序循环
 - **定时自动更换**：node-cron 按分钟级间隔自动换壁纸（最小 5 分钟）
 - **多显示器自适应**：按目标显示器的实际宽高比生成（16:9 / 21:9 / 16:10 / 4:3 / 3:2 / 1:1），4K 分辨率输出
+- **按显示器设置壁纸**：可将壁纸只设到指定显示器（经 Windows `IDesktopWallpaper`），也可选「轮流更换」让每次换壁纸轮到下一台屏幕，游标持久化、重启后接着轮
+- **调用频率限制**：LLM 与文生图各自可配置时间窗口内的调用上限与超限暂停时长，避免被服务方限流
 - **主题配色自定义**：主色、背景、卡片、文字、边框、圆角、按钮颜色、隐藏延迟均可调，主界面与悬浮窗同步
 - **托盘常驻**：关闭窗口不退出，从托盘随时重开或彻底退出
 - **临时文件自清理**：不喜欢的图片移入 `temp/`，按设定的保留天数（0/1/7/30）自动清理
@@ -129,6 +131,14 @@ LLM 与文生图各存一套 **Profile**（`settings` 表的 `llm_profile` / `im
 - 超时 / 网络错误 / 5xx 自动重试 1 次；4xx 直接报错。预生成失败按 60 秒 → 5 分钟 → 15 分钟退避
 - 「测试连接」会显示耗时、返回摘要与 HTTP 状态码；文生图测试会真实生成一张小图（不保存），可能消耗额度
 
+### 调用频率限制
+
+设置页「调用频率限制」里，LLM 与文生图各自统计：`windowMinutes` 分钟内最多调用 `maxCalls` 次，超限后暂停 `penaltyMinutes` 分钟。默认 LLM 为 60 分钟 30 次、超限暂停 30 分钟；文生图为 60 分钟 20 次、超限暂停 60 分钟。
+
+- 成功与失败的请求都计数，累计记录存在 `api_usage` 表，保留最近 7 天
+- 预生成、立即换壁纸、定时换壁纸都受限制；触顶前会先检查两个接口的额度，避免白白调用 LLM
+- 被暂停后可在该页点「清空统计」立即解除，适合改错配置后恢复
+
 ### 主要设置项（存于 `db/wallpaper.db` 的 `settings` 表）
 
 | 键 | 说明 |
@@ -140,11 +150,17 @@ LLM 与文生图各存一套 **Profile**（`settings` 表的 `llm_profile` / `im
 | `style_explore_rate` | 风格探索比例，默认 0.5 |
 | `image_dir` | 图片保存目录，默认程序目录下 `images/` |
 | `temp_clean_interval` | 临时图片保留天数，0 = 永不清理 |
-| `wallpaper_display` | 目标显示器：`primary` / `current` / 索引 |
+| `wallpaper_display` | 壁纸设置到哪个显示器：`all`（所有显示器）/ `rotate`（轮流）/ `primary`（仅主显示器）/ `current` / 索引 |
+| `wallpaper_display_cursor` | 轮流模式的游标（下一次轮到第几台），程序自动维护 |
+
+> 多显示器：`wallpaper` 包在 Windows 上只设置主显示器。选择「仅主显示器」或具体显示器时，程序改用系统自带的 `IDesktopWallpaper`（Windows 8+，经 `lib/windows-wallpaper.ps1` 调用）只更新目标显示器；调用失败会自动回退为全局设置并写日志。
+>
+> 轮流模式：每次换壁纸按屏幕从左到右的顺序换到下一台（显示器 1 → 2 → 1 …），图片比例按本次要换上的屏幕生成，游标持久化，重启后接着轮。
 | `float_position` / `float_x` / `float_y` | 悬浮按钮贴边方向与坐标 |
 | `float_hide_delay` | 鼠标移开后自动收起延迟（毫秒） |
 | `llm_timeout` / `image_timeout` | 接口默认超时（秒），Profile 里填了 `timeoutSec` 时以 Profile 为准 |
 | `preload_enabled` / `preload_idle` / `preload_max` | 预生成开关、空闲分钟数、库存上限 |
+| `llm_rate_limit` / `image_rate_limit` | 调用频率限制（JSON：`enabled` / `windowMinutes` / `maxCalls` / `penaltyMinutes`） |
 
 > 旧字段 `model_url` / `api_key` / `image_url` / `image_key` 会在启动时自动迁移到两份 Profile，之后不再读取。
 
@@ -162,8 +178,9 @@ LLM 与文生图各存一套 **Profile**（`settings` 表的 `llm_profile` / `im
 ├── main.js                     # 主进程：窗口、数据库、生成流程、托盘、定时任务
 ├── preload.js                  # contextBridge 安全桥接，向前端暴露 wallpaperApi
 ├── lib/adapters.js             # 接口适配层：模板、请求规划、响应解析、轮询、重试判定
+├── lib/windows-wallpaper.ps1   # 按显示器设置壁纸（IDesktopWallpaper COM，Windows 8+）
 ├── renderer/
-│   ├── index.html              # 5 页设置界面（模型接入 / 生成与换壁 / 预生成 / 悬浮按钮 / 主题）
+│   ├── index.html              # 6 页设置界面（模型接入 / 生成与换壁 / 预生成 / 频率限制 / 悬浮按钮 / 主题）
 │   ├── app.js                  # 主界面逻辑
 │   └── float.html              # 悬浮按钮窗口（含样式与逻辑）
 ├── test/adapters.test.js       # 离线 mock 测试（4 种返回形态 × 4 种认证）

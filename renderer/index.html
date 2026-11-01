@@ -219,6 +219,7 @@
       <button type="button" data-page="model" class="active">模型接入</button>
       <button type="button" data-page="generate">生成与换壁</button>
       <button type="button" data-page="preload">预生成</button>
+      <button type="button" data-page="ratelimit">调用频率限制</button>
       <button type="button" data-page="float">悬浮按钮与显示器</button>
       <button type="button" data-page="theme">主题外观</button>
     </nav>
@@ -588,10 +589,21 @@
         <div class="form-group">
           <label>壁纸生成显示器</label>
           <select id="wallpaper_display">
-            <option value="primary">主显示器</option>
+            <option value="all">所有显示器（同一张壁纸，默认）</option>
+            <option value="rotate">轮流更换（每次换到下一台显示器）</option>
+            <option value="primary">仅主显示器</option>
             <option value="current">当前壁纸所在显示器</option>
           </select>
-          <div class="hint">不同比例的显示器会生成对应比例的图片。</div>
+          <div class="hint">选“仅主显示器”或具体显示器时，壁纸只会设置到该显示器（Windows 8+）；图片比例按对应显示器生成。</div>
+        </div>
+
+        <div class="form-group" id="rotationGroup" style="display:none;">
+          <label>轮流顺序</label>
+          <div id="rotationStatus" class="status-box">正在读取轮流状态...</div>
+          <div class="btn-group">
+            <button type="button" class="secondary small" id="rotationResetBtn">从第一台重新开始</button>
+          </div>
+          <div class="hint">每次换壁纸轮到下一台显示器（显示器 1 → 2 → 1 …），顺序按屏幕从左到右排列；被轮到的屏幕会用该屏幕的比例生成图片。重启程序后继续接着轮。</div>
         </div>
 
         <div class="form-group" id="progressGroup" style="display:none;">
@@ -643,10 +655,85 @@
           <button type="button" class="secondary small" id="preloadRetryBtn" onclick="retryPreload()">立即重试</button>
         </div>
         <div class="hint">失败后会按 60 秒 → 5 分钟 → 15 分钟自动退避；修改模型配置或点击“立即重试”会清除暂停。</div>
+        <div class="hint">后台预生成会持续消耗 LLM 与文生图调用额度，可在左侧「调用频率限制」页设置每小时上限，避免被服务方限流。</div>
       </div>
     </section>
 
-    <!-- ==================== 4. 悬浮按钮与显示器 ==================== -->
+    <!-- ==================== 4. 调用频率限制 ==================== -->
+    <section class="page" data-page="ratelimit">
+      <div class="page-head">
+        <h1>调用频率限制</h1>
+        <p>限制一段时间内最多调用多少次接口，避免频繁请求被服务方限流或封禁。LLM 与文生图各自独立统计。</p>
+      </div>
+
+      <div class="card">
+        <h2>LLM（生成提示词）
+          <span>
+            <button type="button" class="secondary small" data-rl-refresh="llm">刷新状态</button>
+            <button type="button" class="secondary small" data-rl-reset="llm">清空统计</button>
+          </span>
+        </h2>
+
+        <div class="form-group inline-check">
+          <input id="llm_rl_enabled" type="checkbox" checked>
+          <label for="llm_rl_enabled">启用 LLM 调用频率限制</label>
+        </div>
+
+        <div class="row3">
+          <div class="form-group">
+            <label>统计时间窗口（分钟）</label>
+            <input id="llm_rl_window" type="number" value="60" min="1">
+          </div>
+          <div class="form-group">
+            <label>窗口内最大调用次数</label>
+            <input id="llm_rl_max" type="number" value="30" min="1">
+          </div>
+          <div class="form-group">
+            <label>超限后暂停（分钟）</label>
+            <input id="llm_rl_penalty" type="number" value="30" min="1">
+          </div>
+        </div>
+
+        <div id="llm_rl_status" class="status-box">正在读取调用状态...</div>
+      </div>
+
+      <div class="card">
+        <h2>文生图
+          <span>
+            <button type="button" class="secondary small" data-rl-refresh="image">刷新状态</button>
+            <button type="button" class="secondary small" data-rl-reset="image">清空统计</button>
+          </span>
+        </h2>
+
+        <div class="form-group inline-check">
+          <input id="image_rl_enabled" type="checkbox" checked>
+          <label for="image_rl_enabled">启用文生图调用频率限制</label>
+        </div>
+
+        <div class="row3">
+          <div class="form-group">
+            <label>统计时间窗口（分钟）</label>
+            <input id="image_rl_window" type="number" value="60" min="1">
+          </div>
+          <div class="form-group">
+            <label>窗口内最大调用次数</label>
+            <input id="image_rl_max" type="number" value="20" min="1">
+          </div>
+          <div class="form-group">
+            <label>超限后暂停（分钟）</label>
+            <input id="image_rl_penalty" type="number" value="60" min="1">
+          </div>
+        </div>
+
+        <div id="image_rl_status" class="status-box">正在读取调用状态...</div>
+        <div class="hint">
+          成功与失败的请求都会计入次数；「测试连接」不检查限制，但会真实消耗一次接口额度并计入次数。
+          预生成、立即换壁纸、定时换壁纸都受此限制。被暂停后可点「清空统计」立即解除。
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== 5. 悬浮按钮与显示器 ==================== -->
     <section class="page" data-page="float">
       <div class="page-head">
         <h1>悬浮按钮与显示器</h1>
@@ -671,7 +758,7 @@
       </div>
     </section>
 
-    <!-- ==================== 5. 主题外观 ==================== -->
+    <!-- ==================== 6. 主题外观 ==================== -->
     <section class="page" data-page="theme">
       <div class="page-head">
         <h1>主题外观</h1>

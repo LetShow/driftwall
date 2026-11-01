@@ -10,6 +10,12 @@ contextBridge.exposeInMainWorld('wallpaperApi', {
   getProfiles: () => ipcRenderer.invoke('get-profiles'),
   saveProfile: (role, profile) => ipcRenderer.invoke('save-profile', role, profile),
   testConnection: (role, profile) => ipcRenderer.invoke('test-connection', role, profile),
+  // 调用频率限制（LLM / 文生图各自独立）
+  getRateLimitConfig: (role) => ipcRenderer.invoke('get-rate-limit-config', role),
+  setRateLimitConfig: (role, config) => ipcRenderer.invoke('set-rate-limit-config', role, config),
+  checkRateLimit: (role) => ipcRenderer.invoke('check-rate-limit', role),
+  getApiUsageStats: (role) => ipcRenderer.invoke('get-api-usage-stats', role),
+  resetApiUsage: (role) => ipcRenderer.invoke('reset-api-usage', role),
   // 预生成运行状态（退避/暂停信息）
   getPreloadStatus: () => ipcRenderer.invoke('get-preload-status'),
   resetPreloadBackoff: () => ipcRenderer.invoke('reset-preload-backoff'),
@@ -57,6 +63,9 @@ contextBridge.exposeInMainWorld('wallpaperApi', {
   getWallpaperDisplay: () => ipcRenderer.invoke('get-wallpaper-display'),
   // 设置壁纸生成显示器
   setWallpaperDisplay: (value) => ipcRenderer.invoke('set-wallpaper-display', value),
+  // 轮流换显示器：查询下一次会换到哪台 / 游标复位
+  getDisplayRotation: () => ipcRenderer.invoke('get-display-rotation'),
+  resetDisplayRotation: () => ipcRenderer.invoke('reset-display-rotation'),
   // 移动悬浮窗（拖动用）；persist=true 时同时持久化坐标
   moveFloat: (x, y, persist = false) => ipcRenderer.send('move-float', x, y, persist),
   // 接收悬浮窗初始位置

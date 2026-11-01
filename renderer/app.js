@@ -13,6 +13,12 @@ const SETTINGS_KEYS = [
 const PROFILE_ROLES = ['llm', 'image'];
 const ROLE_LABELS = { llm: 'LLM', image: '文生图' };
 
+// 调用频率限制默认值（与主进程 getRateLimitConfig 保持一致）
+const RATE_LIMIT_DEFAULTS = {
+  llm: { enabled: true, windowMinutes: 60, maxCalls: 30, penaltyMinutes: 30 },
+  image: { enabled: true, windowMinutes: 60, maxCalls: 20, penaltyMinutes: 60 }
+};
+
 // 预设主题定义
 const THEME_PRESETS = {
   default: {
@@ -156,6 +162,7 @@ function setupPageNav() {
     const content = document.querySelector('.content');
     if (content) content.scrollTop = 0;
     if (page === 'preload') refreshPreloadStatus();
+    if (page === 'ratelimit') PROFILE_ROLES.forEach((role) => refreshRateLimitStatus(role));
   });
 }
 
@@ -293,6 +300,102 @@ function setupProfileEvents() {
   }
 }
 
+// ---------- 调用频率限制 ----------
+
+function fillRateLimitConfig(role, config) {
+  const def = RATE_LIMIT_DEFAULTS[role];
+  const cfg = config || def;
+  setFieldChecked(`${role}_rl_enabled`, cfg.enabled !== false);
+  setFieldValue(`${role}_rl_window`, cfg.windowMinutes || def.windowMinutes);
+  setFieldValue(`${role}_rl_max`, cfg.maxCalls || def.maxCalls);
+  setFieldValue(`${role}_rl_penalty`, cfg.penaltyMinutes || def.penaltyMinutes);
+}
+
+function readRateLimitConfig(role) {
+  const def = RATE_LIMIT_DEFAULTS[role];
+  return {
+    enabled: fieldChecked(`${role}_rl_enabled`),
+    windowMinutes: fieldNumber(`${role}_rl_window`, def.windowMinutes),
+    maxCalls: fieldNumber(`${role}_rl_max`, def.maxCalls),
+    penaltyMinutes: fieldNumber(`${role}_rl_penalty`, def.penaltyMinutes)
+  };
+}
+
+async function loadRateLimitConfigs() {
+  for (const role of PROFILE_ROLES) {
+    try {
+      const config = await window.wallpaperApi.getRateLimitConfig(role);
+      fillRateLimitConfig(role, config);
+    } catch (err) {
+      console.log(`加载${ROLE_LABELS[role]}频率限制配置失败:`, err.message);
+    }
+    refreshRateLimitStatus(role);
+  }
+}
+
+async function refreshRateLimitStatus(role) {
+  const box = el(`${role}_rl_status`);
+  if (!box) return;
+  const label = ROLE_LABELS[role] || role;
+  try {
+    const [check, stats] = await Promise.all([
+      window.wallpaperApi.checkRateLimit(role),
+      window.wallpaperApi.getApiUsageStats(role)
+    ]);
+    if (!check) {
+      box.className = 'status-box';
+      box.textContent = '未获取到调用状态';
+      return;
+    }
+
+    const lines = [];
+    if (!check.enabled) {
+      box.className = 'status-box';
+      lines.push(`${label} 频率限制已关闭，请留意服务方的额度限制`);
+    } else if (!check.allowed) {
+      box.className = 'status-box warn';
+      lines.push(check.reason || '已超出频率限制');
+      if (check.penaltyUntil) {
+        lines.push(`解禁时间：${new Date(check.penaltyUntil).toLocaleString()}`);
+      }
+    } else {
+      box.className = 'status-box';
+      lines.push(
+        `运行正常：最近 ${check.windowMinutes} 分钟内已调用 ${check.used}/${check.maxCalls} 次，` +
+        `还可调用 ${check.remaining} 次`
+      );
+    }
+    if (stats && typeof stats.total === 'number') {
+      lines.push(`近 24 小时：成功 ${stats.success} 次，失败 ${stats.errors} 次`);
+    }
+    box.textContent = lines.join('\n');
+  } catch (err) {
+    box.className = 'status-box';
+    box.textContent = '读取调用状态失败：' + err.message;
+  }
+}
+
+function setupRateLimitEvents() {
+  document.querySelectorAll('[data-rl-refresh]').forEach((btn) => {
+    btn.addEventListener('click', () => refreshRateLimitStatus(btn.dataset.rlRefresh));
+  });
+  document.querySelectorAll('[data-rl-reset]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const role = btn.dataset.rlReset;
+      const label = ROLE_LABELS[role] || role;
+      if (!confirm(`确定清空 ${label} 的调用统计吗？这会同时解除当前的超限暂停。`)) return;
+      try {
+        const res = await window.wallpaperApi.resetApiUsage(role);
+        if (!res || !res.success) throw new Error((res && res.error) || '未知错误');
+        showMessage(`${label} 调用统计已清空`, 'success');
+        refreshRateLimitStatus(role);
+      } catch (err) {
+        showMessage('清空统计失败：' + err.message, 'error');
+      }
+    });
+  });
+}
+
 async function testConnection(role) {
   const btn = el(`${role}_test`);
   const out = el(`${role}_test_result`);
@@ -360,17 +463,22 @@ async function loadSettings() {
   if (wallpaperDisplayEl) {
     try {
       const savedSetting = await window.wallpaperApi.getSetting('wallpaper_display');
-      wallpaperDisplayEl.value = savedSetting || 'primary';
+      wallpaperDisplayEl.value = savedSetting || 'all';
 
       const displays = await window.wallpaperApi.getDisplays();
       wallpaperDisplayEl.innerHTML = `
-        <option value="primary">主显示器</option>
+        <option value="all">所有显示器（同一张壁纸，默认）</option>
+        <option value="rotate">轮流更换（每次换到下一台显示器）</option>
+        <option value="primary">仅主显示器</option>
         <option value="current">当前壁纸所在显示器</option>
         ${displays.map(d =>
           `<option value="${d.index}">显示器 ${d.index + 1} (${d.label})</option>`
         ).join('')}
       `;
-      wallpaperDisplayEl.value = savedSetting || 'primary';
+      wallpaperDisplayEl.value = savedSetting || 'all';
+      wallpaperDisplayEl.addEventListener('change', () => refreshRotationStatus());
+      setupRotationEvents();
+      refreshRotationStatus();
     } catch (e) {
       console.log('加载壁纸生成显示器设置失败:', e.message);
     }
@@ -445,6 +553,9 @@ async function loadSettings() {
     console.log('加载悬浮按钮主题失败:', e.message);
   }
 
+  // 调用频率限制配置
+  await loadRateLimitConfigs();
+
   refreshPreloadStatus();
 }
 
@@ -472,6 +583,14 @@ async function saveSettings() {
       const res = await window.wallpaperApi.saveProfile(role, profiles[role]);
       if (!res || !res.success) {
         throw new Error((res && res.error) || `${ROLE_LABELS[role]} 配置保存失败`);
+      }
+    }
+
+    // 保存调用频率限制配置
+    for (const role of PROFILE_ROLES) {
+      const res = await window.wallpaperApi.setRateLimitConfig(role, readRateLimitConfig(role));
+      if (!res || !res.success) {
+        throw new Error((res && res.error) || `${ROLE_LABELS[role]} 频率限制保存失败`);
       }
     }
 
@@ -523,6 +642,8 @@ async function saveSettings() {
     }
 
     showMessage('设置已保存', 'success');
+    PROFILE_ROLES.forEach((role) => refreshRateLimitStatus(role));
+    refreshRotationStatus();
     refreshPreloadStatus();
   } catch (err) {
     showMessage('保存失败：' + err.message, 'error');
@@ -558,14 +679,16 @@ async function changeNow() {
   try {
     const result = await window.wallpaperApi.changeWallpaper();
     if (result && result.success) {
-      showMessage(
-        result.fromLibrary
-          ? '壁纸已更换成功（来自预生成库，秒出）'
-          : `壁纸已更换成功！耗时 ${Math.round(result.elapsed / 1000)} 秒`,
-        'success'
-      );
+      let text = result.fromLibrary
+        ? '壁纸已更换成功（来自预生成库，秒出）'
+        : `壁纸已更换成功！耗时 ${Math.round(result.elapsed / 1000)} 秒`;
+      if (result.rotation) {
+        text += `｜本次换到显示器 ${result.rotation.displayIndex + 1}`;
+      }
+      showMessage(text, 'success');
       if (progressGroup) progressGroup.style.display = 'none';
       loadPreview();
+      refreshRotationStatus();
     } else {
       showMessage('换壁纸失败：' + (result ? result.error : '未知错误'), 'error');
     }
@@ -702,6 +825,60 @@ function setupThemeListeners() {
   });
 }
 
+// ---------- 轮流换显示器 ----------
+
+function setupRotationEvents() {
+  const resetBtn = el('rotationResetBtn');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', async () => {
+      try {
+        await window.wallpaperApi.resetDisplayRotation();
+        showMessage('轮流顺序已重置，下次从第一台开始', 'success');
+        refreshRotationStatus();
+      } catch (err) {
+        showMessage('重置失败：' + err.message, 'error');
+      }
+    });
+  }
+}
+
+async function refreshRotationStatus() {
+  const group = el('rotationGroup');
+  const box = el('rotationStatus');
+  if (!group || !box) return;
+
+  // 只有选中「轮流更换」时才显示这块
+  const selected = fieldValue('wallpaper_display');
+  if (selected !== 'rotate') {
+    group.style.display = 'none';
+    return;
+  }
+  group.style.display = 'block';
+
+  try {
+    const info = await window.wallpaperApi.getDisplayRotation();
+    if (!info || !info.total) {
+      box.className = 'status-box warn';
+      box.textContent = '没有检测到可用显示器';
+      return;
+    }
+    const order = (info.list || []).map((d) => d.label).join(' → ');
+    const next = info.next
+      ? `下一次换到：${info.next.label}（${info.next.width}×${info.next.height}）`
+      : '下一次换到：未知';
+    if (info.total === 1) {
+      box.className = 'status-box warn';
+      box.textContent = `只检测到 1 台显示器（${order}），轮流效果与“仅主显示器”相同。\n${next}`;
+      return;
+    }
+    box.className = 'status-box';
+    box.textContent = `轮流顺序：${order}（共 ${info.total} 台）\n${next}`;
+  } catch (err) {
+    box.className = 'status-box';
+    box.textContent = '读取轮流状态失败：' + err.message;
+  }
+}
+
 // 当前壁纸预览（生成与换壁页）
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -747,9 +924,17 @@ setupPageNav();
 loadSettings();
 setupIdleReset();
 setupThemeListeners();
+setupRateLimitEvents();
 loadPreview();
 setInterval(loadPreview, 10000);
 setInterval(refreshPreloadStatus, 5000);
+// 频率限制状态定期刷新（限制页可见时才有意义，顺手刷新也不贵）
+setInterval(() => {
+  const page = document.querySelector('section.page[data-page="ratelimit"]');
+  if (page && page.classList.contains('active')) {
+    PROFILE_ROLES.forEach((role) => refreshRateLimitStatus(role));
+  }
+}, 15000);
 // 换壁纸后主进程会推送当前壁纸，立即刷新预览
 window.wallpaperApi.onCurrentImage(() => loadPreview());
 // 正式生成失败 / 预生成退避状态推送

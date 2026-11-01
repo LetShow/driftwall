@@ -3,6 +3,7 @@ const path = require("path");
 const url = require("url");
 const fs = require("fs");
 const util = require("util");
+const { execFile } = require("child_process");
 const axios = require("axios");
 const cron = require("node-cron");
 const initSqlJs = require("sql.js");
@@ -146,7 +147,11 @@ async function initDatabase() {
     console.log("[DB] 打开现有数据库:", dbPath);
   } else {
     db = new SQL.Database();
-    db.run(`
+    console.log("[DB] 创建新数据库:", dbPath);
+  }
+
+  // 无论新旧数据库都执行建表：老版本数据库升级时需要补上新增的表/字段
+  db.run(`
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT
@@ -166,17 +171,31 @@ async function initDatabase() {
         score INTEGER DEFAULT 0,
         updated_at TEXT
       );
+      CREATE TABLE IF NOT EXISTS api_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'success',
+        error_message TEXT
+      );
     `);
-    console.log("[DB] 创建新数据库:", dbPath);
-  }
+
   dbReady = true;
   migrateApiProfiles();
+  cleanApiUsage();
 }
 
 // 把旧版的四个接口字段迁移成两个 Profile（ADR-011）。
 // 迁移时保留 Agnes 的 4K + ratio + extra_body 参数，避免升级后现有服务直接不可用。
 function migrateApiProfiles() {
   try {
+    // 频率限制默认配置：新老数据库都补一份，方便设置页直接显示和修改
+    for (const role of ["llm", "image"]) {
+      if (!getSetting(`${role}_rate_limit`)) {
+        setSetting(`${role}_rate_limit`, JSON.stringify(RATE_LIMIT_DEFAULTS[role]));
+      }
+    }
+
     if (getSetting("llm_profile")) return;
     const llm = adapters.normalizeProfile("llm", {
       template: "openai-compatible",
@@ -233,6 +252,151 @@ function setSetting(key, value) {
   ]);
   saveDatabase();
   console.log("[DB] 设置已保存:", key, "=", value);
+}
+
+// 频率限制配置（按角色区分默认值，与迁移、界面保持一致）
+const RATE_LIMIT_DEFAULTS = {
+  llm: { enabled: true, windowMinutes: 60, maxCalls: 30, penaltyMinutes: 30 },
+  image: { enabled: true, windowMinutes: 60, maxCalls: 20, penaltyMinutes: 60 },
+};
+
+function getRateLimitConfig(role) {
+  const defaultConfig = RATE_LIMIT_DEFAULTS[role] || RATE_LIMIT_DEFAULTS.llm;
+  
+  try {
+    const configStr = getSetting(`${role}_rate_limit`, JSON.stringify(defaultConfig));
+    const parsed = JSON.parse(configStr);
+    const config = { ...defaultConfig, ...(parsed && typeof parsed === "object" ? parsed : {}) };
+    // 收敛数值，避免旧配置/手改配置里的 0、负数、字符串把窗口算成 NaN
+    config.enabled = config.enabled !== false && config.enabled !== "false";
+    for (const key of ["windowMinutes", "maxCalls", "penaltyMinutes"]) {
+      const n = Number(config[key]);
+      config[key] = Number.isFinite(n) && n > 0 ? Math.floor(n) : defaultConfig[key];
+    }
+    return config;
+  } catch (e) {
+    console.error(`[频率限制] 读取${role}配置失败:`, e.message);
+    return defaultConfig;
+  }
+}
+
+function saveRateLimitConfig(role, config) {
+  try {
+    const configStr = JSON.stringify(config);
+    setSetting(`${role}_rate_limit`, configStr);
+    console.log(`[频率限制] ${role}配置已保存:`, config);
+  } catch (e) {
+    console.error(`[频率限制] 保存${role}配置失败:`, e.message);
+  }
+}
+
+// 记录API调用（成功/失败都会消耗一次本地额度，避免失败请求反复敲接口）
+function recordApiCall(role, status = 'success', errorMessage = '') {
+  if (!dbReady) return;
+
+  const timestamp = new Date().toISOString();
+  try {
+    dbExec(
+      "INSERT INTO api_usage (role, timestamp, status, error_message) VALUES (?, ?, ?, ?)",
+      [role, timestamp, status, errorMessage]
+    );
+    // 立即落盘，避免重启后频率窗口被清零、限制形同虚设
+    saveDatabase();
+  } catch (e) {
+    console.error(`[频率限制] 记录${role}调用失败:`, e.message);
+  }
+}
+
+// 频率限制统计只保留最近 7 天，避免 api_usage 表无限增长
+const API_USAGE_RETENTION_DAYS = 7;
+function cleanApiUsage() {
+  if (!dbReady) return;
+  try {
+    const cutoff = new Date(Date.now() - API_USAGE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    dbExec("DELETE FROM api_usage WHERE timestamp < ?", [cutoff]);
+    saveDatabase();
+  } catch (e) {
+    console.error("[频率限制] 清理历史统计失败:", e.message);
+  }
+}
+
+// 检查是否超出频率限制
+// 返回 { allowed, used, remaining, windowMinutes, maxCalls, penaltyUntil?, reason }
+function checkRateLimit(role) {
+  const config = getRateLimitConfig(role);
+  const base = {
+    enabled: !!config.enabled,
+    windowMinutes: config.windowMinutes,
+    maxCalls: config.maxCalls,
+    penaltyMinutes: config.penaltyMinutes,
+  };
+  if (!dbReady || !config.enabled) {
+    return { ...base, allowed: true, used: 0, remaining: config.maxCalls, reason: '频率限制已禁用' };
+  }
+
+  try {
+    const now = Date.now();
+    const penaltyMs = Math.max(1, config.penaltyMinutes) * 60 * 1000;
+
+    // 1）检查惩罚期：最近一次触发限制的时间 + 惩罚时长仍未到，则继续拦截
+    const lastPenalty = dbQuery(
+      "SELECT timestamp FROM api_usage WHERE role = ? AND status = 'rate_limited' ORDER BY timestamp DESC LIMIT 1",
+      [role],
+    );
+    if (lastPenalty) {
+      const until = new Date(lastPenalty.timestamp).getTime() + penaltyMs;
+      if (Number.isFinite(until) && now < until) {
+        const remainMin = Math.max(1, Math.ceil((until - now) / 60000));
+        return {
+          ...base,
+          allowed: false,
+          used: null,
+          remaining: 0,
+          penaltyUntil: new Date(until).toISOString(),
+          reason: `超出频率限制，还需等待约 ${remainMin} 分钟`,
+        };
+      }
+    }
+
+    // 2）统计时间窗口内的调用次数（rate_limited 只是拦截标记，不计入额度）
+    const windowStart = new Date(now - Math.max(1, config.windowMinutes) * 60 * 1000).toISOString();
+    const countRow = dbQuery(
+      "SELECT COUNT(*) as count FROM api_usage WHERE role = ? AND timestamp >= ? AND status <> 'rate_limited'",
+      [role, windowStart],
+    );
+    const used = countRow ? countRow.count : 0;
+
+    if (used >= config.maxCalls) {
+      recordApiCall(role, 'rate_limited', `超出频率限制 (${used}/${config.maxCalls})`);
+      const until = now + penaltyMs;
+      return {
+        ...base,
+        allowed: false,
+        used,
+        remaining: 0,
+        penaltyUntil: new Date(until).toISOString(),
+        reason: `超出频率限制（${used}/${config.maxCalls} 次 / ${config.windowMinutes} 分钟），请约 ${config.penaltyMinutes} 分钟后再试`,
+      };
+    }
+
+    return {
+      ...base,
+      allowed: true,
+      used,
+      remaining: config.maxCalls - used,
+      reason: '频率限制检查通过',
+    };
+  } catch (e) {
+    // 频率限制本身出错时放行，避免把“换壁纸”整个卡死
+    console.error(`[频率限制] 检查${role}调用状态失败，本次放行:`, e.message);
+    return {
+      ...base,
+      allowed: true,
+      used: 0,
+      remaining: config.maxCalls,
+      reason: '频率限制检查失败，已放行',
+    };
+  }
 }
 
 // 数据库就绪状态
@@ -394,6 +558,274 @@ function notifyProgress(message) {
   }
 }
 
+// ==================== 按显示器设置壁纸（Windows） ====================
+// wallpaper 包在 Windows 上只设置主显示器，多显示器下“壁纸生成显示器”只会影响长宽比。
+// 这里改用 Windows 8+ 的 IDesktopWallpaper COM（由 lib/windows-wallpaper.ps1 调用），
+// 把壁纸只设置到用户选择的显示器；不支持或失败时回退到 wallpaper 包。
+const WINDOWS_WALLPAPER_SCRIPT_SRC = path.join(__dirname, "lib", "windows-wallpaper.ps1");
+const WINDOWS_WALLPAPER_SCRIPT = path.join(dataRoot, "temp", "windows-wallpaper.ps1");
+
+function ensureWindowsWallpaperScript() {
+  // 打包后脚本在 asar 里，powershell 不能直接执行，先释放到可写的 temp 目录
+  const content = fs.readFileSync(WINDOWS_WALLPAPER_SCRIPT_SRC);
+  let needWrite = true;
+  try {
+    needWrite = fs.readFileSync(WINDOWS_WALLPAPER_SCRIPT).compare(content) !== 0;
+  } catch (e) {
+    needWrite = true;
+  }
+  if (needWrite) {
+    const dir = path.dirname(WINDOWS_WALLPAPER_SCRIPT);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(WINDOWS_WALLPAPER_SCRIPT, content);
+  }
+  return WINDOWS_WALLPAPER_SCRIPT;
+}
+
+async function runWindowsWallpaper(args) {
+  const script = ensureWindowsWallpaperScript();
+  const { stdout } = await util.promisify(execFile)(
+    "powershell.exe",
+    [
+      "-NoProfile",
+      "-NonInteractive",
+      "-ExecutionPolicy", "Bypass",
+      "-File", script,
+      ...args,
+    ],
+    { windowsHide: true, timeout: 20000, maxBuffer: 1024 * 1024 },
+  );
+  return String(stdout || "").trim();
+}
+
+// list 输出：index \t left \t top \t right \t bottom \t devicePath
+function parseWindowsMonitorList(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const parts = line.split("\t");
+      if (parts.length < 6) return null;
+      const index = Number(parts[0]);
+      const left = Number(parts[1]);
+      const top = Number(parts[2]);
+      const right = Number(parts[3]);
+      const bottom = Number(parts[4]);
+      if (!Number.isFinite(index)) return null;
+      return {
+        index,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+        devicePath: parts.slice(5).join("\t"),
+      };
+    })
+    .filter(Boolean);
+}
+
+async function listWindowsMonitors() {
+  if (process.platform !== "win32") return [];
+  try {
+    return parseWindowsMonitorList(await runWindowsWallpaper(["-Action", "list"]));
+  } catch (e) {
+    console.error("[壁纸] 枚举显示器失败:", e.message);
+    return [];
+  }
+}
+
+// 把设置值（all / primary / current / 索引）解析成 Electron 的显示器对象
+function resolveTargetDisplay(displayValue) {
+  const displays = screen.getAllDisplays();
+  const primary = displays.find((d) => d.isPrimary) || displays[0];
+  if (!primary) return null;
+  if (displayValue === undefined || displayValue === null || displayValue === "") {
+    return primary;
+  }
+  if (displayValue === "all" || displayValue === "primary" || displayValue === "current") {
+    return primary;
+  }
+  const idx = parseInt(displayValue, 10);
+  return Number.isFinite(idx) ? displays[idx] || primary : primary;
+}
+
+// Electron 的显示器是 DIP 坐标，IDesktopWallpaper 是物理像素，需要换算后再匹配
+function matchWindowsMonitor(monitors, display) {
+  if (!display || monitors.length === 0) return null;
+  const scale = Number(display.scaleFactor) > 0 ? Number(display.scaleFactor) : 1;
+  const b = display.bounds;
+  const target = {
+    x: Math.round(b.x * scale),
+    y: Math.round(b.y * scale),
+    width: Math.round(b.width * scale),
+    height: Math.round(b.height * scale),
+  };
+  const near = (a, b2, tol = 2) => Math.abs(a - b2) <= tol;
+
+  // 1) 位置 + 尺寸完全匹配（缩放一致时最可靠）
+  const exact = monitors.find(
+    (m) =>
+      near(m.x, target.x) &&
+      near(m.y, target.y) &&
+      near(m.width, target.width) &&
+      near(m.height, target.height),
+  );
+  if (exact) return exact;
+
+  // 2) 尺寸唯一匹配（分辨率不同时最可靠）
+  const sameSize = monitors.filter(
+    (m) => near(m.width, target.width) && near(m.height, target.height),
+  );
+  if (sameSize.length === 1) return sameSize[0];
+
+  // 3) 两边都按“从左到右、从上到下”排序后按位置对应
+  const byPosition = (a, b2) => a.x - b2.x || a.y - b2.y;
+  const sortedMonitors = monitors.slice().sort(byPosition);
+  const allDisplays = screen.getAllDisplays();
+  const sortedDisplays = allDisplays
+    .slice()
+    .sort((a, b2) => byPosition(a.bounds, b2.bounds));
+  const pos = sortedDisplays.indexOf(display);
+  if (pos >= 0 && pos < sortedMonitors.length) return sortedMonitors[pos];
+
+  return null;
+}
+
+function describeDisplayValue(displayValue) {
+  if (displayValue === "all") return "所有显示器";
+  if (displayValue === "primary") return "主显示器";
+  if (displayValue === "current") return "当前壁纸所在显示器";
+  if (displayValue === "rotate") return "轮流显示器";
+  const idx = parseInt(displayValue, 10);
+  return Number.isFinite(idx) ? `显示器 ${idx + 1}` : "主显示器";
+}
+
+// ==================== 轮流换显示器 ====================
+// 「轮流显示器」模式：每次换壁纸自动轮到下一台显示器（显示器1 → 显示器2 → 显示器1 …）。
+// 游标存在 settings.wallpaper_display_cursor，程序重启后继续接着轮，不会每次都从第一台开始。
+// 显示器数量/排列变化导致游标越界时自动回到第一台，避免一直落空。
+
+// 当前所有显示器的索引列表（按“从左到右、从上到下”排序，读数更直观）
+function getDisplayRotationOrder() {
+  const displays = screen.getAllDisplays();
+  if (displays.length === 0) return [];
+  return displays
+    .map((d, index) => ({ index, display: d }))
+    .sort(
+      (a, b) =>
+        a.display.bounds.x - b.display.bounds.x ||
+        a.display.bounds.y - b.display.bounds.y ||
+        a.index - b.index,
+    )
+    .map((item) => item.index);
+}
+
+function readRotationCursor() {
+  try {
+    const raw = parseInt(getSetting("wallpaper_display_cursor", "0"), 10);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+function saveRotationCursor(value) {
+  try {
+    setSetting("wallpaper_display_cursor", String(value));
+  } catch (e) {
+    console.error("[轮流显示器] 保存游标失败:", e.message);
+  }
+}
+
+// 取下一台要换的显示器索引，并把游标推进一格
+// 返回 { displayIndex, position, total } 或 null（没有显示器）
+// position 是 1-based 的“第几台”，用于进度提示
+function nextRotateDisplayIndex() {
+  const order = getDisplayRotationOrder();
+  if (order.length === 0) return null;
+  let cursor = readRotationCursor();
+  if (!Number.isFinite(cursor) || cursor < 0 || cursor >= order.length) cursor = 0;
+  const displayIndex = order[cursor];
+  const position = cursor + 1;
+  const nextCursor = (cursor + 1) % order.length;
+  saveRotationCursor(nextCursor);
+  return { displayIndex, position, total: order.length };
+}
+
+// 把壁纸设置到用户选择的显示器；非 Windows 或失败时回退到 wallpaper 包
+async function applyWallpaperToDisplay(imagePath, displayValue) {
+  const wp = await getWallpaperModule();
+  if (process.platform !== "win32") {
+    await wp.setWallpaper(imagePath);
+    return { mode: "all", fallback: false };
+  }
+
+  const value =
+    displayValue === undefined || displayValue === null || displayValue === ""
+      ? "all"
+      : String(displayValue);
+
+  if (value === "all") {
+    try {
+      await runWindowsWallpaper(["-Action", "setall", "-Path", imagePath]);
+      return { mode: "all", fallback: false };
+    } catch (e) {
+      console.error("[壁纸] 全局设置失败，回退 wallpaper 包:", e.message);
+      await wp.setWallpaper(imagePath);
+      return { mode: "all", fallback: true };
+    }
+  }
+
+  try {
+    const monitors = await listWindowsMonitors();
+    if (monitors.length === 0) throw new Error("未枚举到显示器");
+    const display = resolveTargetDisplay(value);
+    const monitor = matchWindowsMonitor(monitors, display);
+    if (!monitor) {
+      throw new Error(`未匹配到目标显示器（${describeDisplayValue(value)}）`);
+    }
+    await runWindowsWallpaper([
+      "-Action", "set",
+      "-Index", String(monitor.index),
+      "-Path", imagePath,
+    ]);
+    console.log(
+      `[壁纸] 已设置到${describeDisplayValue(value)}（系统显示器 #${monitor.index + 1}）`,
+    );
+    return { mode: "single", monitorIndex: monitor.index, fallback: false };
+  } catch (e) {
+    console.error(
+      `[壁纸] 按显示器设置失败（${describeDisplayValue(value)}），回退为全局设置:`,
+      e.message,
+    );
+    await wp.setWallpaper(imagePath);
+    return { mode: "all", fallback: true, error: e.message };
+  }
+}
+
+// 读取“当前设置的目标显示器”上的壁纸路径（启动时识别用）
+async function getCurrentWallpaperPath() {
+  if (process.platform === "win32") {
+    try {
+      const monitors = await listWindowsMonitors();
+      const display = resolveTargetDisplay(getSetting("wallpaper_display", "all"));
+      const monitor = matchWindowsMonitor(monitors, display);
+      if (monitor) {
+        const path = await runWindowsWallpaper([
+          "-Action", "get",
+          "-Index", String(monitor.index),
+        ]);
+        if (path) return path;
+      }
+    } catch (e) {
+      console.log("[壁纸] 读取目标显示器壁纸失败，回退主显示器:", e.message);
+    }
+  }
+  const wp = await getWallpaperModule();
+  return String((await wp.getWallpaper()) || "").trim();
+}
+
 // 设为桌面壁纸
 let wallpaperModule = null;
 async function getWallpaperModule() {
@@ -404,9 +836,24 @@ async function getWallpaperModule() {
 }
 
 async function setWallpaper(imagePath) {
-  notifyProgress("正在设置桌面壁纸...");
-  const wp = await getWallpaperModule();
-  await wp.setWallpaper(imagePath);
+  let displayValue = getSetting("wallpaper_display", "all");
+  // 轮流模式：每次换壁纸前推进游标，拿到本次要换的显示器
+  let rotation = null;
+  if (displayValue === "rotate") {
+    rotation = nextRotateDisplayIndex();
+    if (rotation) {
+      displayValue = String(rotation.displayIndex);
+      notifyProgress(
+        `轮流换显示器：本次换到第 ${rotation.position}/${rotation.total} 台（显示器 ${rotation.displayIndex + 1}）`,
+      );
+    } else {
+      console.error("[轮流显示器] 没有可用显示器，回退为主显示器");
+      displayValue = "primary";
+    }
+  }
+
+  notifyProgress(`正在设置桌面壁纸（${describeDisplayValue(displayValue)}）...`);
+  const applied = await applyWallpaperToDisplay(imagePath, displayValue);
   // 记录显示时间
   dbExec("UPDATE images SET last_shown = ? WHERE path = ?", [
     new Date().toISOString(),
@@ -417,6 +864,7 @@ async function setWallpaper(imagePath) {
   if (row) setCurrentImageId(row.id);
   saveDatabase();
   notifyProgress("桌面壁纸已设置完成");
+  return { rotation, applied };
 }
 
 // ==================== 当前壁纸 & 喜欢/不喜欢 ====================
@@ -583,8 +1031,7 @@ ipcMain.handle("get-current-image", () => getCurrentImage());
 // 也让悬浮窗一打开就知道该评价哪一张（而不是提示“还没有壁纸”）
 async function initCurrentImage() {
   try {
-    const wp = await getWallpaperModule();
-    const current = (await wp.getWallpaper() || "").trim();
+    const current = await getCurrentWallpaperPath();
     if (!current) return;
     // 路径大小写不敏感匹配（盘符大小写可能不同）
     const row = dbQuery("SELECT id FROM images WHERE LOWER(path) = LOWER(?)", [current]);
@@ -955,6 +1402,12 @@ async function pollImage(profile, taskId, timeoutMs, quiet) {
 
 // 调用 LLM 生成提示词正文（方法 A / 方法 B 共用），返回原始文本
 async function callPromptLLM(userContent) {
+  // 检查LLM频率限制
+  const rateLimitCheck = checkRateLimit("llm");
+  if (!rateLimitCheck.allowed) {
+    throw new Error(rateLimitCheck.reason);
+  }
+
   const profile = getProfile("llm");
   if (!profile.url) {
     throw new Error("请先在「模型接入」里填写 LLM 接口地址");
@@ -975,8 +1428,14 @@ async function callPromptLLM(userContent) {
   try {
     const resp = await apiRequest(req, { timeoutMs });
     const data = parseResponseBody(resp);
-    return adapters.extractText(data, profile);
+    const text = adapters.extractText(data, profile);
+
+    // 解析成功后才记录，避免解析失败时又额外记一次成功
+    recordApiCall("llm", "success");
+    return text;
   } catch (err) {
+    // 记录失败调用
+    recordApiCall("llm", "error", err.message);
     const message = `LLM 调用失败：${describeApiError(err)}`;
     reportApiError("llm", message, err);
     throw new Error(message);
@@ -998,6 +1457,12 @@ async function generatePrompt() {
 
 // 文生图（调用用户配置的服务）
 async function generateImage(prompt) {
+  // 检查文生图频率限制
+  const rateLimitCheck = checkRateLimit("image");
+  if (!rateLimitCheck.allowed) {
+    throw new Error(rateLimitCheck.reason);
+  }
+
   const profile = getProfile("image");
   const saveDir = getSetting("image_dir") || path.join(dataRoot, "images");
 
@@ -1010,7 +1475,7 @@ async function generateImage(prompt) {
     throw new Error("请先在「模型接入」里填写文生图接口地址");
   }
 
-  const wallpaperDisplaySetting = getSetting("wallpaper_display", "primary");
+  const wallpaperDisplaySetting = getSetting("wallpaper_display", "all");
   const targetRatio = getDisplayRatio(wallpaperDisplaySetting);
   console.log(
     `[预生成] 文生图模板: ${profile.template}, 显示器: ${wallpaperDisplaySetting}, 长宽比: ${targetRatio}`,
@@ -1052,8 +1517,13 @@ async function generateImage(prompt) {
     const filePath = await materializeImage(image, saveDir, profile, timeoutMs);
     console.log("[预生成] 图片文件已写入:", filePath);
     notifyProgress("图片已保存:" + filePath);
+    
+    // 记录成功调用
+    recordApiCall("image", "success");
     return filePath;
   } catch (err) {
+    // 记录失败调用
+    recordApiCall("image", "error", err.message);
     const message = `文生图调用失败：${describeApiError(err)}`;
     reportApiError("image", message, err);
     throw new Error(message);
@@ -1062,6 +1532,7 @@ async function generateImage(prompt) {
 
 // 测试连接：LLM 发一条极短消息；文生图会真实生成一张（不保存），用于验证鉴权与解析路径
 async function testConnection(role, rawProfile) {
+  // 测试连接暂时跳过频率限制，但仍然记录调用
   const profile = adapters.normalizeProfile(
     role,
     rawProfile || getProfile(role),
@@ -1084,6 +1555,7 @@ async function testConnection(role, rawProfile) {
       });
       const resp = await apiRequest(req, { timeoutMs: 30000, retry: false });
       const text = adapters.extractText(parseResponseBody(resp), profile);
+      recordApiCall("llm", "success");
       return result({ success: true, detail: text.slice(0, 200) });
     }
 
@@ -1113,8 +1585,10 @@ async function testConnection(role, rawProfile) {
     } else {
       detail = `返回二进制图片（约 ${Math.round(image.value.length / 1024)} KB）`;
     }
+    recordApiCall("image", "success");
     return result({ success: true, detail });
   } catch (err) {
+    recordApiCall(role, "error", err.message);
     return result({
       success: false,
       detail: describeApiError(err),
@@ -1262,7 +1736,7 @@ async function changeWallpaper() {
     const fromLib = pickFromLibrary(currentImageId);
     if (fromLib) {
       notifyProgress("预生成库有待选图片，直接取一张上墙");
-      await setWallpaper(fromLib.path);
+      const applied = await setWallpaper(fromLib.path);
       const elapsed = Date.now() - startTime;
       notifyProgress(`=== 换壁纸完成（来自预生成库），耗时 ${elapsed}ms ===`);
       return {
@@ -1270,20 +1744,32 @@ async function changeWallpaper() {
         fromLibrary: true,
         imagePath: fromLib.path,
         prompt: fromLib.prompt,
+        rotation: applied && applied.rotation,
         elapsed,
       };
     }
 
     // 2）无待选图片 → 迫切生成（方法 B：先生成图片，再提取关键字）
     notifyProgress("预生成库没有可用图片，现场生成（方法 B）...");
+    // 先看两个接口的本地额度，避免 LLM 调用完了才发现文生图已被限制
+    const imageCheck = checkRateLimit("image");
+    if (!imageCheck.allowed) throw new Error(imageCheck.reason);
+    const llmCheck = checkRateLimit("llm");
+    if (!llmCheck.allowed) throw new Error(llmCheck.reason);
     const { prompt, keywords } = await generatePrompt();
     const imagePath = await generateImage(prompt);
     notifyProgress("正在保存到数据库...");
     saveImageRecord(imagePath, prompt, keywords);
-    await setWallpaper(imagePath);
+    const applied = await setWallpaper(imagePath);
     const elapsed = Date.now() - startTime;
     notifyProgress(`=== 换壁纸完成，耗时 ${elapsed}ms ===`);
-    return { success: true, imagePath, prompt, elapsed };
+    return {
+      success: true,
+      imagePath,
+      prompt,
+      rotation: applied && applied.rotation,
+      elapsed,
+    };
   } catch (err) {
     const elapsed = Date.now() - startTime;
     console.error(`换壁纸失败(${elapsed}ms):`, err.message);
@@ -1346,14 +1832,124 @@ ipcMain.handle("test-connection", (event, role, profile) =>
   testConnection(role, profile),
 );
 
+// 获取频率限制配置
+ipcMain.handle("get-rate-limit-config", (event, role) => {
+  return getRateLimitConfig(role);
+});
+
+// 设置频率限制配置
+ipcMain.handle("set-rate-limit-config", (event, role, config) => {
+  if (role !== "llm" && role !== "image") {
+    return { success: false, error: "未知的角色类型" };
+  }
+  try {
+    saveRateLimitConfig(role, config);
+    return { success: true, config };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 检查频率限制状态
+ipcMain.handle("check-rate-limit", (event, role) => {
+  return checkRateLimit(role);
+});
+
+// 清空调用统计（同时解除因超限产生的暂停）
+ipcMain.handle("reset-api-usage", (event, role) => {
+  if (!dbReady) return { success: false, error: "数据库尚未就绪" };
+  try {
+    if (role === "llm" || role === "image") {
+      dbExec("DELETE FROM api_usage WHERE role = ?", [role]);
+    } else {
+      dbExec("DELETE FROM api_usage");
+    }
+    saveDatabase();
+    console.log("[频率限制] 已清空调用统计:", role || "全部");
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+});
+
+// 获取API使用统计
+ipcMain.handle("get-api-usage-stats", (event, role) => {
+  if (!dbReady) return { total: 0, success: 0, errors: 0, recent: [] };
+  try {
+    const now = Date.now();
+    const dayStart = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+    
+    // 获取24小时内的统计
+    const stats = dbQueryAll(
+      "SELECT status, COUNT(*) as count FROM api_usage WHERE role = ? AND timestamp >= ? GROUP BY status",
+      [role, dayStart]
+    );
+    
+    // 获取最近的10条记录
+    const recent = dbQueryAll(
+      "SELECT timestamp, status, error_message FROM api_usage WHERE role = ? ORDER BY timestamp DESC LIMIT 10",
+      [role]
+    );
+    
+    const total = stats.reduce((sum, s) => sum + s.count, 0);
+    const success = stats.find(s => s.status === 'success')?.count || 0;
+    const errors = stats.find(s => s.status === 'error')?.count || 0;
+    
+    return { total, success, errors, recent };
+  } catch (e) {
+    console.error("[频率限制] 获取API使用统计失败:", e.message);
+    return { total: 0, success: 0, errors: 0, recent: [] };
+  }
+});
+
 // 获取壁纸生成显示器设置
 ipcMain.handle("get-wallpaper-display", () => {
-  return getSetting("wallpaper_display", "primary");
+  return getSetting("wallpaper_display", "all");
 });
 
 // 设置壁纸生成显示器
 ipcMain.handle("set-wallpaper-display", (event, value) => {
   setSetting("wallpaper_display", value);
+  // 刚切到轮流模式时从第一台开始；切走再切回来也重新开始，避免用户以为没生效
+  if (value === "rotate") saveRotationCursor(0);
+  return { success: true };
+});
+
+// 轮流显示器状态：下一次会换到哪台、共几台
+ipcMain.handle("get-display-rotation", () => {
+  const order = getDisplayRotationOrder();
+  const displays = screen.getAllDisplays();
+  let cursor = readRotationCursor();
+  if (order.length === 0) {
+    return { enabled: getSetting("wallpaper_display", "all") === "rotate", total: 0, next: null, list: [] };
+  }
+  if (!Number.isFinite(cursor) || cursor < 0 || cursor >= order.length) cursor = 0;
+  const nextIndex = order[cursor];
+  const d = displays[nextIndex];
+  return {
+    enabled: getSetting("wallpaper_display", "all") === "rotate",
+    total: order.length,
+    next: {
+      index: nextIndex,
+      label: `显示器 ${nextIndex + 1}`,
+      width: d ? d.bounds.width : 0,
+      height: d ? d.bounds.height : 0,
+    },
+    list: order.map((idx) => {
+      const dd = displays[idx];
+      return {
+        index: idx,
+        label: `显示器 ${idx + 1}`,
+        width: dd ? dd.bounds.width : 0,
+        height: dd ? dd.bounds.height : 0,
+      };
+    }),
+  };
+});
+
+// 手动把轮流游标复位到第一台
+ipcMain.handle("reset-display-rotation", () => {
+  saveRotationCursor(0);
   return { success: true };
 });
 
@@ -1393,12 +1989,13 @@ function calculateAspectRatio(width, height) {
 }
 
 // 获取指定显示器的长宽比
+// 「轮流显示器」模式用游标指向的下一台显示器算比例，保证生成的图片和本次要换上的屏幕一致
 function getDisplayRatio(displayIndex = null) {
   const allDisplays = screen.getAllDisplays();
-  
+
   // 如果没有指定显示器索引，使用主显示器
   let display;
-  if (displayIndex === null || displayIndex === "primary") {
+  if (displayIndex === null || displayIndex === "primary" || displayIndex === "all") {
     display = allDisplays.find(d => d.isPrimary) || allDisplays[0];
   } else if (displayIndex === "current") {
     // 获取当前壁纸所在的显示器
@@ -1410,11 +2007,19 @@ function getDisplayRatio(displayIndex = null) {
     } else {
       display = allDisplays.find(d => d.isPrimary) || allDisplays[0];
     }
+  } else if (displayIndex === "rotate") {
+    // 只看游标指向的下一台显示器，不推进游标（推进发生在真正上墙时）
+    const order = getDisplayRotationOrder();
+    let cursor = readRotationCursor();
+    if (!Number.isFinite(cursor) || cursor < 0 || cursor >= order.length) cursor = 0;
+    const target = order.length > 0 ? order[cursor] : -1;
+    display = allDisplays[target] || allDisplays.find(d => d.isPrimary) || allDisplays[0];
   } else {
     // 使用指定的显示器索引
     display = allDisplays[displayIndex] || allDisplays[0];
   }
-  
+
+  if (!display) return "16:9";
   return calculateAspectRatio(display.bounds.width, display.bounds.height);
 }
 
@@ -1573,6 +2178,10 @@ async function generateImageMethodA() {
 
   try {
     console.log("[预生成] ===== 开始生成单张图片 =====");
+
+    // 步骤 0：先确认两个接口的本地额度，避免做无用功
+    const imageCheck = checkRateLimit("image");
+    if (!imageCheck.allowed) return { success: false, error: imageCheck.reason };
 
     // 步骤 1：抽风格种子 + 决定是否参考历史喜好（探索/利用）
     const s1 = stepStart();
@@ -1897,6 +2506,7 @@ if (!gotSingleInstanceLock) {
     // 临时文件定期清理：启动 30 秒后清一次，之后每小时检查一次
     setTimeout(cleanTempFiles, 30 * 1000);
     setInterval(cleanTempFiles, 60 * 60 * 1000);
+    setInterval(cleanApiUsage, 60 * 60 * 1000);
   });
 
   app.on("window-all-closed", () => {

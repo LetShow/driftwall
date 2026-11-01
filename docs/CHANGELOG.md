@@ -57,6 +57,109 @@
 
 ---
 
+## 1.2.0 — 轮流换显示器
+
+> 状态：已随 1.2.0 发布（2026-11-01）。轮换逻辑已用断言验证，多显示器实机交替待用户确认。
+
+### 现象
+多显示器用户希望每换一次壁纸就换到下一台屏幕（显示器 1 → 2 → 1 …），而不是固定只更新某一台。
+
+### 改动文件
+- `main.js`
+  - 新增 `getDisplayRotationOrder()`：按屏幕从左到右、从上到下排序，得到轮换顺序
+  - 新增 `readRotationCursor()` / `saveRotationCursor()` / `nextRotateDisplayIndex()`：游标存 `wallpaper_display_cursor`，重启后继续接着轮；显示器数量变化导致游标越界时自动复位
+  - `setWallpaper()`：`rotate` 模式下先推进游标，再把本次壁纸设置到对应显示器，并把轮换信息返回给调用方
+  - `getDisplayRatio()`：`rotate` 模式只读游标指向的下一台显示器比例（不推进），保证生成的图片比例和目标屏幕一致
+  - `changeWallpaper()`：两种来源（预生成库 / 现场生成）都返回 `rotation` 信息
+  - 新增 IPC：`get-display-rotation`（下一次换到哪台、顺序列表）、`reset-display-rotation`（游标复位）
+  - `set-wallpaper-display`：切到 `rotate` 时把游标归零
+- `preload.js`：暴露 `getDisplayRotation` / `resetDisplayRotation`
+- `renderer/index.html`：显示器下拉新增「轮流更换」，并加轮流状态区与「从第一台重新开始」按钮
+- `renderer/app.js`：轮换状态渲染、复位按钮、换壁纸成功提示带上本次显示器编号
+- `test/rotation.check.js`（新增）：轮换游标断言（2 台 / 3 台 / 越界 / 单台 / 进度编号）
+- `README.md`：补充 `wallpaper_display_cursor` 与轮流模式说明
+
+### 验证方式
+- `node test/rotation.check.js`：2 台交替 `0→1→0→1`、3 台 `0→1→2→0`、越界复位、单台重复、进度编号 `1,2` 全部通过
+- `node --check` 三个文件通过；`npm test` 12 项通过
+
+### 未验证项
+- 实机连续换壁纸观察两台显示器是否严格交替
+- 程序重启后游标是否接着上一次继续
+- 拖拽显示器排列顺序改变后的轮换顺序
+
+---
+
+## 1.2.0 — 壁纸按显示器设置
+
+> 状态：已随 1.2.0 发布（2026-11-01）。已实机验证（双显示器，Win + PowerShell）。
+
+### 现象
+在「生成与换壁」页把「壁纸生成显示器」设为显示器 2 后，换壁纸仍然只改变显示器 1 的桌面。
+
+### 根因
+- 该设置此前只用于 `getDisplayRatio()` 决定生成图片的长宽比，从未参与真正设置壁纸
+- `setWallpaper()` 统一调用 `wallpaper` 包，而该包在 Windows 下把 screen 硬编码为主显示器（readme 明确写 "On Linux and Windows it's hard-coded to `'main'`"），所以永远只改主屏
+- 启动时识别当前壁纸也用主屏路径，与目标显示器不一致
+
+### 改动文件
+- `lib/windows-wallpaper.ps1`（新增）：调用 `IDesktopWallpaper` COM，支持 `list` / `set -Index` / `setall` / `get -Index`，仅依赖系统自带 powershell.exe
+- `main.js`
+  - 新增 `ensureWindowsWallpaperScript()`：打包后脚本在 asar 内，先释放到 `temp/` 再执行
+  - 新增 `listWindowsMonitors()` / `matchWindowsMonitor()`：Electron 显示器是 DIP 坐标，COM 是物理像素，按 `scaleFactor` 换算后匹配（精确位置 →
+    唯一尺寸 → 排序位置兜底）
+  - 新增 `applyWallpaperToDisplay()`：`all` 走 `setall`，其余只设置目标显示器；任何失败都回退 `wallpaper` 包并写日志
+  - `setWallpaper()` 读取 `wallpaper_display` 并按显示器设置，进度提示带上目标显示器名
+  - 新增 `getCurrentWallpaperPath()`：启动识别改读目标显示器上的壁纸
+  - `generateImage()` 默认值改为 `all`，与设置页保持一致
+- `renderer/index.html`：显示器下拉新增「所有显示器（同一张壁纸，默认）」并调整说明
+- `renderer/app.js`：保存/回填默认值改为 `all`
+
+### 验证方式
+- `lib\windows-wallpaper.ps1 -Action list` 正确枚举 2 台显示器（0: 0,0 1920×1080；1: 1920,303 1920×1080）
+- `-Action get` 读回两台显示器各自的壁纸路径，确认两者本就不同
+- 对 `-Index 1` 执行 `-Action set` 后：显示器 1 壁纸路径不变，显示器 2 变为新图片 ✅
+- `node --check` 三个文件通过；`npm test` 12 项通过
+
+### 未验证项
+- 打包产物（asar）内释放脚本并设置壁纸
+- 不同缩放比例（125% / 150%）下的显示器匹配
+- 显示器热插拔后索引变化
+
+---
+
+## 1.2.0 — 调用频率限制
+
+> 状态：已随 1.2.0 发布（2026-11-01）。界面交互已实跑，触顶拦截与重启保持待用户确认。
+
+### 现象
+预生成和定时换壁纸会持续调用 LLM 与文生图接口，长时间运行后容易被服务方限流或封禁；设置页没有任何节流配置。
+
+### 根因
+- 只有“失败退避”（预生成 60 秒 → 5 分钟 → 15 分钟），没有“成功调用次数”上限
+- 预生成库存未满时会连续生成，LLM 与文生图调用频率完全由库存和空闲时间决定
+
+### 改动文件
+- `main.js`
+  - 新增 `api_usage` 表记录每次调用（角色 / 时间 / 成功失败 / 错误信息），保留 7 天
+  - 新增 `RATE_LIMIT_DEFAULTS`、`getRateLimitConfig()`、`saveRateLimitConfig()`、`checkRateLimit()`、`recordApiCall()`、`cleanApiUsage()`
+  - LLM 与文生图独立统计：时间窗口内调用次数触顶后进入惩罚期，期间直接拒绝调用
+  - `callPromptLLM()` / `generateImage()` 调用前检查额度，成功/失败后计数；解析失败不会重复记成功
+  - `changeWallpaper()` 与 `generateImageMethodA()` 增加前置检查，避免文生图已被限制时还白白调用 LLM
+  - 建表语句改为新旧数据库都执行，老库升级时自动补 `api_usage` 表
+  - 新增 IPC：`get-rate-limit-config` / `set-rate-limit-config` / `check-rate-limit` / `get-api-usage-stats` / `reset-api-usage`
+- `preload.js`：暴露上述频率限制接口
+- `renderer/index.html`：新增「调用频率限制」页（LLM / 文生图两组开关、窗口、上限、惩罚时长，状态框与清空统计按钮）；预生成页补提示
+- `renderer/app.js`：频率限制配置读写、状态刷新、清空统计、保存与定时刷新
+- `README.md`：补充调用频率限制说明与 `llm_rate_limit` / `image_rate_limit` 设置项
+
+### 验证方式
+- `node --check main.js` / `preload.js` / `renderer/app.js` 通过
+- `npm test`：12 项全部通过
+- 待实机验证：界面保存后重启仍生效、触顶后预生成/立即换壁纸被拦截且提示等待时间、清空统计后立即恢复
+
+---
+
 ## [1.1.0] — 多格式 API 适配层
 
 > 状态：已发布（2026-10-31）。方案见 ADR-011。
