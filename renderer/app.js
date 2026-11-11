@@ -1,5 +1,6 @@
 const SETTINGS_KEYS = [
   'auto_change_enabled', 'interval', 'llm_timeout', 'image_timeout', 'image_dir', 'temp_clean_interval',
+  'image_max_age_days',
   'change_mode', 'style_explore_rate',
   'float_display', 'float_hide_delay',
   'preload_enabled', 'preload_idle', 'preload_max',
@@ -594,11 +595,26 @@ async function saveSettings() {
       }
     }
 
+    // 记住「图片最长保留时间」的旧值，保存后若变了就立刻清一次过期图片
+    const maxAgeNode = el('image_max_age_days');
+    const oldMaxAge = (await window.wallpaperApi.getSetting('image_max_age_days')) || '0';
+
     for (const key of SETTINGS_KEYS) {
       const node = el(key);
       if (node) {
         const val = node.type === 'checkbox' ? (node.checked ? 'true' : 'false') : node.value.trim();
         await window.wallpaperApi.setSetting(key, val);
+      }
+    }
+
+    // 保留天数变化后立即清理，让用户马上看到效果
+    let cleanupNote = '';
+    if (maxAgeNode && maxAgeNode.value.trim() !== oldMaxAge) {
+      try {
+        const res = await window.wallpaperApi.cleanupImages();
+        if (res && res.removed > 0) cleanupNote = `，已清理 ${res.removed} 张过期图片`;
+      } catch (err) {
+        console.log('立即清理过期图片失败:', err.message);
       }
     }
 
@@ -641,7 +657,7 @@ async function saveSettings() {
       await window.wallpaperApi.restartAutoChange();
     }
 
-    showMessage('设置已保存', 'success');
+    showMessage('设置已保存' + cleanupNote, 'success');
     PROFILE_ROLES.forEach((role) => refreshRateLimitStatus(role));
     refreshRotationStatus();
     refreshPreloadStatus();

@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('wallpaperApi', {
   isDbReady: () => ipcRenderer.invoke('is-db-ready'),
   getSetting: (key) => ipcRenderer.invoke('get-setting', key),
   setSetting: (key, value) => ipcRenderer.invoke('set-setting', key, value),
+  // 立刻执行一次存储清理（临时文件 + 超过最长保留期的图片）
+  cleanupImages: () => ipcRenderer.invoke('cleanup-images'),
   // 接口 Profile（模型接入页）
   getProfileMeta: () => ipcRenderer.invoke('get-profile-meta'),
   getProfileDefaults: (role, template) => ipcRenderer.invoke('get-profile-defaults', role, template),

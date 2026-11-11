@@ -51,6 +51,7 @@ screenshots/
 skills-lock.json
 test/*
 !test/adapters.test.js
+!test/retention.test.js
 test_sqlite/
 test-flow.js
 

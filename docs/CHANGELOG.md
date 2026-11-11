@@ -242,3 +242,46 @@ ADR 与代码不一致：ADR-008 描述的能力未实现；ADR-010 写了开机
 ### 验证方式
 - 通读 ADR-011/012 与本次讨论结论逐条对照
 - `git diff` 确认旧 ADR 正文除状态行外未被改写
+
+---
+
+## 1.3.0 — 图片最长保留时间
+
+> 状态：已随 1.3.0 发布（2026-11-11）。沙箱实跑验证删除/保留分支，当前壁纸保护分支仅单测覆盖。
+
+### 现象
+喜欢过的图片会永久留在图库里、权重还更高，时间一长图库几乎被旧图占满，"换壁纸"反复换到同一批图，桌面很难再换到新图；用户也没有任何手段强制淘汰旧图。
+
+### 根因
+- 抽取逻辑（`pickFromLibrary`）只排除 `disliked`，`liked` / `normal` 永不过期，图库只进不出
+- 设置里只有 `temp_clean_interval`（不喜欢 → temp 目录的清理），没有针对整个图库的保留期
+
+### 改动文件
+- `lib/retention.js`（新增）：`selectExpiredImages()` 纯函数——按 cutoff 挑出该删的行；受保护路径跳过；年龄无法判断的宁可漏删不误删
+- `main.js`
+  - 新设置项 `image_max_age_days`（`0` = 永久保留，默认），`getMaxAgeDays()` 读取
+  - `cleanExpiredImages()`：先删文件、成功后再删记录（文件删不掉就保留记录，避免下次抽到空路径）
+  - `getProtectedWallpaperPaths()`：当前图片记录 + 各显示器真实壁纸路径（轮流模式逐台读），保证正在显示的壁纸不被删，等换下去之后由下一轮再删
+  - `runStorageCleanup()`：临时文件 + 过期图片的统一入口，加锁防重入，接替原 `cleanTempFiles` 的"启动 30 秒后 / 每小时"定时
+  - 新增 IPC `cleanup-images`，设置页改完天数后立即清一次
+- `preload.js`：暴露 `cleanupImages()`
+- `renderer/index.html`：「图片最长保留时间」下拉（永久保留 / 7 / 15 / 30 / 90 / 180 / 365 天）+ 说明
+- `renderer/app.js`：`SETTINGS_KEYS` 加入 `image_max_age_days`；保存后若天数变化立即清理，成功提示带上删除张数
+- `test/retention.test.js`（新增）；`package.json` 的 `npm test` 纳入新测试
+- `README.md` 设置项表补 `image_max_age_days`；`.gitignore` 放行新测试文件
+
+### 验证方式
+- `npm test`（Node 22）：18 项全部通过，其中 6 项覆盖保留期判断（三种状态都删、边界值、受保护路径、年龄不可判、`getAgeMs` 兜底、非法入参）
+- `node --check` 通过：`main.js` / `preload.js` / `renderer/app.js` / `lib/retention.js`
+- **沙箱实跑（2026-11-11）**：用 `PORTABLE_EXECUTABLE_DIR` + `--user-data-dir` 指向临时目录（不碰本机真实 `db/`、`images/`，也不影响本机正在运行的 Driftwall 实例），预置 `image_max_age_days=3` 与 6 条记录后启动，启动 30 秒的那轮清理日志 `[过期清理] 已删除 5 张超过 3 天的图片`，结果逐条符合预期：
+  - 超期 `normal` / `liked` / `disliked`（在 temp 里）→ 文件与记录都删除
+  - 超期但文件已被手动删掉 → 记录删除
+  - 超期且 `created_at` 为空（文件 mtime 为 10 天前）→ 按 mtime 兜底删除
+  - 未超期、以及 `created_at` 为空且 mtime 为今天 → 保留
+  - `temp/` 里的非图片文件（`windows-wallpaper.ps1`）不受影响（只删 `images` 表记录对应的文件）
+
+### 未验证项
+- 多显示器「轮流」模式下逐台读取壁纸路径的耗时与单台失败回退；**「正在显示的壁纸被跳过」这一保护分支未实跑**（需要指向本机真实桌面壁纸路径才测得到，风险大于收益），仅由 `test/retention.test.js` 的受保护路径用例覆盖
+- 图片文件被占用（正设为壁纸）时 `unlinkSync` 失败 → 保留记录的分支
+- 设置页下拉的 UI 观感（未在窗口内实点）；保存后「已清理 N 张过期图片」提示未实点
+- 打包产物（portable exe）实跑

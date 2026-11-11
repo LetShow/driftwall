@@ -8,6 +8,7 @@ const axios = require("axios");
 const cron = require("node-cron");
 const initSqlJs = require("sql.js");
 const adapters = require("./lib/adapters");
+const retention = require("./lib/retention");
 
 // 运行时数据目录：开发时用项目目录；打包后放在 exe 同级目录（而不是 app.asar 内部），
 // 这样数据库/图片仍可读写，拷走整个文件夹即可迁移（绿色软件）
@@ -1072,6 +1073,128 @@ function cleanTempFiles() {
     console.log(`[清理] 已清理 ${removed} 个临时文件（保留 ${days} 天）`);
   }
 }
+
+// ==================== 图片最长保留期 ====================
+// 设置项 image_max_age_days：超过该天数的图片不管 normal/liked/disliked 一律删除，
+// 让图库持续换血，桌面壁纸才可能永远换到新图（否则喜欢过的图会永久占满图库、
+// 反复被抽中，换壁纸名存实亡）。0 = 永久保留（默认），启动 30 秒后检查一次，之后每小时一次。
+
+// 图片最长保留天数：0 = 永久保留（不清理）
+function getMaxAgeDays() {
+  try {
+    const days = parseInt(getSetting("image_max_age_days", "0"), 10);
+    return Number.isFinite(days) && days > 0 ? days : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// 当前正显示在桌面上的壁纸路径（统一小写后比较）。
+// 这些文件一旦删掉桌面就会花/重启后丢壁纸，必须跳过，
+// 等下次换壁纸把它们换下去之后，再由下一轮清理删掉（清理是每小时一轮的）。
+async function getProtectedWallpaperPaths() {
+  const set = new Set();
+  const add = (p) => {
+    const s = String(p || "").trim();
+    if (s) set.add(s.toLowerCase());
+  };
+
+  // 1）当前记录中的这张（悬浮按钮评价对象）
+  try {
+    if (currentImageId) {
+      const row = dbQuery("SELECT path FROM images WHERE id = ?", [currentImageId]);
+      if (row) add(row.path);
+    }
+  } catch (e) {
+    console.log("[过期清理] 读取当前图片记录失败:", e.message);
+  }
+
+  // 2）各显示器上真实设置的壁纸（轮流换显示器模式下每台都不一样）
+  try {
+    if (process.platform === "win32") {
+      const monitors = await listWindowsMonitors();
+      for (const m of monitors) {
+        try {
+          add(await runWindowsWallpaper(["-Action", "get", "-Index", String(m.index)]));
+        } catch (e) {
+          // 单台读失败不影响其余显示器
+        }
+      }
+    } else {
+      const wp = await getWallpaperModule();
+      add(await wp.getWallpaper());
+    }
+  } catch (e) {
+    console.log("[过期清理] 读取桌面壁纸失败，仅按当前图片记录保护:", e.message);
+  }
+  return set;
+}
+
+// 删除超过最长保留期的图片：先删文件、成功后再删记录
+function cleanExpiredImages(protectedPaths) {
+  const days = getMaxAgeDays();
+  if (days <= 0 || !dbReady) return 0;
+
+  const rows = dbQueryAll("SELECT id, path, created_at FROM images");
+  const expired = retention.selectExpiredImages(rows, {
+    cutoffMs: Date.now() - days * retention.DAY_MS,
+    protectedPaths: protectedPaths instanceof Set ? protectedPaths : new Set(),
+    getAgeMs: (row) => {
+      const created = Date.parse(row.created_at || "");
+      if (Number.isFinite(created)) return created;
+      // 老数据没有创建时间时退回文件修改时间；两者都没有就无法判断年龄（不删）
+      try {
+        return row.path && fs.existsSync(row.path)
+          ? fs.statSync(row.path).mtimeMs
+          : null;
+      } catch (e) {
+        return null;
+      }
+    },
+  });
+
+  let removed = 0;
+  for (const row of expired) {
+    try {
+      if (row.path && fs.existsSync(row.path)) fs.unlinkSync(row.path);
+    } catch (e) {
+      // 文件删不掉就不动记录，避免图库凭空少图、下次换壁纸抽到空路径
+      console.error("[过期清理] 删除图片文件失败，保留该记录:", row.path, e.message);
+      continue;
+    }
+    dbExec("DELETE FROM images WHERE id = ?", [row.id]);
+    removed++;
+  }
+
+  if (removed > 0) {
+    saveDatabase();
+    console.log(`[过期清理] 已删除 ${removed} 张超过 ${days} 天的图片`);
+  }
+  return removed;
+}
+
+// 存储清理入口：临时文件 + 过期图片。定时器和设置页手动触发共用，加锁防重入
+let storageCleanupRunning = false;
+async function runStorageCleanup() {
+  if (storageCleanupRunning) return 0;
+  storageCleanupRunning = true;
+  try {
+    cleanTempFiles();
+    if (getMaxAgeDays() <= 0) return 0;
+    return cleanExpiredImages(await getProtectedWallpaperPaths());
+  } catch (e) {
+    console.error("[过期清理] 清理失败:", e.message);
+    return 0;
+  } finally {
+    storageCleanupRunning = false;
+  }
+}
+
+// 设置页改完「图片最长保留时间」后立刻清一次，让用户马上看到效果
+ipcMain.handle("cleanup-images", async () => {
+  const removed = await runStorageCleanup();
+  return { success: true, removed };
+});
 
 // ==================== 风格随机池：从源头保证壁纸风格多样化 ====================
 // 背景：只靠 LLM“随机生成”会自我收敛（同一主题反复出现），而旧版把整段提示词
@@ -2503,9 +2626,9 @@ if (!gotSingleInstanceLock) {
     initCurrentImage();
     // 启动自动换壁纸
     startAutoChange();
-    // 临时文件定期清理：启动 30 秒后清一次，之后每小时检查一次
-    setTimeout(cleanTempFiles, 30 * 1000);
-    setInterval(cleanTempFiles, 60 * 60 * 1000);
+    // 存储定期清理（临时文件 + 超过最长保留期的图片）：启动 30 秒后清一次，之后每小时检查一次
+    setTimeout(runStorageCleanup, 30 * 1000);
+    setInterval(runStorageCleanup, 60 * 60 * 1000);
     setInterval(cleanApiUsage, 60 * 60 * 1000);
   });
 

@@ -587,6 +587,20 @@
         </div>
 
         <div class="form-group">
+          <label>图片最长保留时间</label>
+          <select id="image_max_age_days" data-default="0">
+            <option value="0">永久保留（默认）</option>
+            <option value="7">7 天</option>
+            <option value="15">15 天</option>
+            <option value="30">30 天</option>
+            <option value="90">90 天</option>
+            <option value="180">180 天</option>
+            <option value="365">365 天</option>
+          </select>
+          <div class="hint">超过该天数的图片无论「喜欢 / 不喜欢 / 未评价」都会被删除，图库持续换新，桌面壁纸才能一直换下去。当前正在显示的壁纸会保留到下次更换后再清理；启动 30 秒后检查一次，之后每小时检查一次。</div>
+        </div>
+
+        <div class="form-group">
           <label>壁纸生成显示器</label>
           <select id="wallpaper_display">
             <option value="all">所有显示器（同一张壁纸，默认）</option>
