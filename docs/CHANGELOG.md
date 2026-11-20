@@ -285,3 +285,40 @@ ADR 与代码不一致：ADR-008 描述的能力未实现；ADR-010 写了开机
 - 图片文件被占用（正设为壁纸）时 `unlinkSync` 失败 → 保留记录的分支
 - 设置页下拉的 UI 观感（未在窗口内实点）；保存后「已清理 N 张过期图片」提示未实点
 - 打包产物（portable exe）实跑
+
+---
+
+## 1.4.0 — 开机自启（ADR-010 落地）
+
+> 状态：代码已实现并完成沙箱实跑验证（2026-11-20，开发模式）；便携版打包产物与真实重启电脑流程未验证。
+
+### 现象
+启动电脑后程序不会自动运行，每次都要手动双击 exe；ADR-010 早已采纳"开机自启"决策，但代码里没有任何 `app.setLoginItemSettings` 调用，设置页也没有对应开关（文档与实现长期不一致）。
+
+### 根因
+- 功能只写进了 ADR / 方案文档，从未实现；`随机壁纸_方案.md` 规划的 `auto_start` 设置项也一直没落地
+
+### 改动文件
+- `main.js`
+  - 新增 `autoStartTarget()`：按运行形态算出要注册的登录项路径——便携版用 `PORTABLE_EXECUTABLE_FILE`（`process.execPath` 指向 NSIS 解压的临时目录，注册它会失效），安装版用 `process.execPath`，开发模式用 `electron.exe` + 项目路径；启动参数统一带 `--hidden`
+  - 新增 `applyAutoStart()`：读设置项 `auto_start` 后调用 `app.setLoginItemSettings` 写/删系统登录项；同时用 `auto_start_path` 记录上次注册路径，便携版升级改名后自动注销旧的失效启动项
+  - `set-setting` IPC：保存 `auto_start` 时立即同步登录项，不用等重启
+  - 启动流程：`createMainWindow({ show })` 支持隐藏创建；`--hidden` 启动时只驻留托盘和悬浮按钮；`initDatabase()` 后调用一次 `applyAutoStart()` 对齐系统状态
+- `renderer/index.html`：「生成与换壁」页顶部新增「开机启动」卡片与 `auto_start` 复选框（默认关闭）
+- `renderer/app.js`：`SETTINGS_KEYS` 加入 `auto_start`
+- `ADR-001-技术选型.md`：ADR-010 状态改为已实现
+- `README.md`：设置项表补 `auto_start`
+
+### 验证方式
+- `node --check` 通过：`main.js` / `preload.js` / `renderer/app.js`
+- `npm test`：18 项全部通过
+- **沙箱实跑（2026-11-20，Win11，开发模式）**：用 `PORTABLE_EXECUTABLE_DIR` 指向临时目录（不碰本机真实 `db/`），种子 `auto_start=true` 后 `electron . --hidden` 启动：
+  - 注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 出现 `electron.app.Electron = <electron.exe> <项目路径> --hidden`；日志 `[启动] 模式: 后台驻留（--hidden，开机自启）`、`[自启] 开机自启已开启，登录项: ...`
+  - 窗口枚举确认：主窗口 `Driftwall · 随机壁纸` `visible=False`，唯一可见窗口是 100×180 的悬浮按钮（预期显示），托盘图标窗口存在
+  - 种子 `auto_start=false` 重启后：日志 `[自启] 开机自启已关闭`，注册表条目被删除
+  - 验证后沙箱目录、种子脚本已删除，注册表无残留
+
+### 未验证项
+- 便携版（portable exe）实跑：登录项指向便携 exe、开机经 NSIS 外壳带 `--hidden` 参数转发
+- 真实重启电脑后的开机拉起流程；Windows 10 实机
+- 升级换名后旧启动项自动注销的分支（代码已处理，未构造复现）

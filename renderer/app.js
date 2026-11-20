@@ -1,4 +1,5 @@
 const SETTINGS_KEYS = [
+  'auto_start',
   'auto_change_enabled', 'interval', 'llm_timeout', 'image_timeout', 'image_dir', 'temp_clean_interval',
   'image_max_age_days',
   'change_mode', 'style_explore_rate',

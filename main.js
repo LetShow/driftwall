@@ -255,6 +255,41 @@ function setSetting(key, value) {
   console.log("[DB] 设置已保存:", key, "=", value);
 }
 
+// ==================== 开机自启（ADR-010） ====================
+// 设置项 auto_start（"true" 开启，其余关闭，默认关闭），设置页「常规」页开关控制。
+// 系统登录项写法：
+// - 便携版：process.execPath 指向 NSIS 外壳解压出的临时目录，必须注册用户双击的
+//   便携 exe（外壳通过 PORTABLE_EXECUTABLE_FILE 暴露），否则开机启动指向临时目录
+// - 安装版 / unpacked：直接用 process.execPath
+// - 开发模式：注册 electron.exe，把项目目录作为启动参数带上
+// 启动参数 --hidden：开机拉起时只驻留托盘和悬浮按钮，不弹设置窗口
+function autoStartTarget() {
+  if (!app.isPackaged) {
+    return { path: process.execPath, args: [app.getAppPath(), "--hidden"] };
+  }
+  const exe = process.env.PORTABLE_EXECUTABLE_FILE || process.execPath;
+  return { path: exe, args: ["--hidden"] };
+}
+
+function applyAutoStart() {
+  if (!dbReady) return;
+  const enabled = getSetting("auto_start") === "true";
+  const target = autoStartTarget();
+  try {
+    app.setLoginItemSettings({ openAtLogin: enabled, path: target.path, args: target.args });
+    // 便携版文件名带版本号（Driftwall-1.4.0-portable.exe），升级换名后旧启动项会失效，
+    // 顺手注销上次记录的路径，避免注册表里留下指向旧文件的残留
+    const prevPath = getSetting("auto_start_path");
+    if (prevPath && prevPath !== target.path) {
+      app.setLoginItemSettings({ openAtLogin: false, path: prevPath, args: target.args });
+    }
+    if (enabled) setSetting("auto_start_path", target.path);
+    console.log(`[自启] 开机自启已${enabled ? "开启" : "关闭"}，登录项: ${target.path}`);
+  } catch (e) {
+    console.error("[自启] 设置登录项失败:", e.message);
+  }
+}
+
 // 频率限制配置（按角色区分默认值，与迁移、界面保持一致）
 const RATE_LIMIT_DEFAULTS = {
   llm: { enabled: true, windowMinutes: 60, maxCalls: 30, penaltyMinutes: 30 },
@@ -410,10 +445,11 @@ let isQuitting = false;
 // 托盘图标，用于主窗口关闭后依然能找到程序并安全退出
 let tray = null;
 
-function createMainWindow() {
+function createMainWindow({ show = true } = {}) {
   mainWin = new BrowserWindow({
     width: 1000,
     height: 720,
+    show, // 开机自启（--hidden）时创建但不显示，托盘/悬浮按钮照常工作
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -1917,7 +1953,11 @@ ipcMain.handle("ignore-image", (event, imageId) => {
 
 // 读写设置
 ipcMain.handle("get-setting", (event, key) => getSetting(key));
-ipcMain.handle("set-setting", (event, key, value) => setSetting(key, value));
+ipcMain.handle("set-setting", (event, key, value) => {
+  setSetting(key, value);
+  // 开机自启开关：保存后立即同步系统登录项，不用等下次重启
+  if (key === "auto_start") applyAutoStart();
+});
 
 // ==================== 接口 Profile（ADR-011） ====================
 
@@ -2615,12 +2655,17 @@ if (!gotSingleInstanceLock) {
   app.whenReady().then(async () => {
     await initDatabase();
     loadPreloadConfig();
+    // 开机自启（--hidden）：只驻留托盘和悬浮按钮，不弹设置窗口
+    const startHidden = process.argv.includes("--hidden");
+    console.log(`[启动] 模式: ${startHidden ? "后台驻留（--hidden，开机自启）" : "正常"}，argv: ${JSON.stringify(process.argv.slice(1))}`);
     // 不喜欢的图片存放目录
     const tempDir = path.join(dataRoot, "temp");
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
-    createMainWindow();
+    createMainWindow({ show: !startHidden });
     createFloatWindow();
     createTray();
+    // 启动时把系统登录项与设置对齐（升级换名后修掉失效的旧启动项）
+    applyAutoStart();
     startPreloadCheck();
     // 识别启动时的桌面壁纸（放在悬浮窗创建之后，好把结果推给它）
     initCurrentImage();

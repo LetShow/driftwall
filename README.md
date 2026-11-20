@@ -147,6 +147,7 @@ LLM 与文生图各存一套 **Profile**（`settings` 表的 `llm_profile` / `im
 | `llm_profile` | LLM 接口配置（JSON：模板 / 地址 / Key / 模型 / 认证 / 请求体 / 响应路径 / 轮询） |
 | `image_profile` | 文生图接口配置（同上，另含尺寸档位与下载鉴权） |
 | `interval` | 自动换壁纸间隔（分钟） |
+| `auto_start` | 开机自启（`true` = 登录 Windows 时自动在后台启动，默认关闭；便携版记录的注册路径存在 `auto_start_path`） |
 | `change_mode` | `random`（加权随机）/ `sequential`（按顺序） |
 | `style_explore_rate` | 风格探索比例，默认 0.5 |
 | `image_dir` | 图片保存目录，默认程序目录下 `images/` |
