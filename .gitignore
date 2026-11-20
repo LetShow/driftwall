@@ -38,6 +38,7 @@ logs/
 *.p12
 *.pfx
 secrets.json
+PAT
 
 # ===== 本地开发笔记（不公开） =====
 README_4K更新.md
